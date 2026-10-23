@@ -1,703 +1,585 @@
 import { useState, useEffect, useMemo } from 'react'
-import { useOutletContext, useSearchParams } from 'react-router-dom'
+import { useNavigate, useOutletContext, useSearchParams } from 'react-router-dom'
 import { 
   FileUp, 
   FileText, 
-  Copy, 
-  Check, 
-  Download, 
   Search, 
   Clock, 
   Users, 
-  Sparkles,
-  Upload,
-  Video
+  ArrowRight,
+  AlertCircle,
+  RefreshCw,
+  CheckCircle2,
+  FileCheck,
+  Loader2,
+  FileCode,
+  X
 } from 'lucide-react'
 import Modal from '../components/Modal.jsx'
-import { transcript as demoTranscript, liveTranscript } from '../data/demo.js'
-
-// Initial seed transcripts from external apps and CommitFlow
-const INITIAL_TRANSCRIPTS = [
-  {
-    id: 'zoom-client-review',
-    title: 'Client Architecture Review - Acme Corp',
-    source: 'Zoom',
-    sourceColor: '#2d8cff',
-    date: 'Yesterday, 2:30 PM',
-    duration: '45 min',
-    participants: ['Alex Rivera', 'David Chen', 'Elena Rostova', 'Michael Chang'],
-    entries: [
-      { who: 'Alex Rivera', t: '00:01', text: "Thanks for joining everyone. Today we're reviewing the Acme Corp cloud migration plan." },
-      { who: 'David Chen', t: '00:15', text: "We have finalized the {Kubernetes cluster architecture} on AWS. I will document the IAM roles by Wednesday." },
-      { who: 'Elena Rostova', t: '00:32', text: "Great. I'll prepare the {database backup and failover} strategy and share the draft with security." },
-      { who: 'Michael Chang', t: '00:48', text: "We also need to ensure compliance logs are retained for 90 days. I can verify the policy." },
-      { who: 'Alex Rivera', t: '01:05', text: "Confirmed. Let's reconvene on Thursday to approve the migration checklist before execution." }
-    ]
-  },
-  {
-    id: 'meet-q4-product',
-    title: 'Q4 Product Roadmap & Feature Finalization',
-    source: 'Google Meet',
-    sourceColor: '#00ac47',
-    date: 'Today, 10:00 AM',
-    duration: '35 min',
-    participants: ['Sarah Nguyen', 'James Chen', 'Maria Kim'],
-    entries: demoTranscript.map((t, idx) => ({
-      who: t.who,
-      t: `10:1${idx + 2}`,
-      text: t.text
-    }))
-  },
-  {
-    id: 'teams-eng-standup',
-    title: 'Daily Engineering Standup',
-    source: 'Microsoft Teams',
-    sourceColor: '#505ac9',
-    date: 'Oct 21, 9:30 AM',
-    duration: '20 min',
-    participants: ['John Bergson', 'Sarah Franci', 'Lydia Botosh'],
-    entries: liveTranscript.map(t => ({
-      who: t.who,
-      t: t.t,
-      text: t.text
-    }))
-  }
-]
-
-// Flexible transcript parser supporting Zoom, Teams, Google Meet, WebVTT, SRT, and plain text
-export function parseTranscriptText(text) {
-  if (!text || !text.trim()) return []
-
-  const lines = text.split(/\r?\n/)
-  const entries = []
-  let currentSpeaker = ''
-  let currentTime = ''
-  let currentText = []
-
-  const commit = () => {
-    if (currentText.length > 0) {
-      entries.push({
-        who: currentSpeaker || 'Participant',
-        t: currentTime || '',
-        text: currentText.join(' ').trim()
-      })
-      currentText = []
-    }
-  }
-
-  // Regex patterns for various meeting app transcript formats
-  const bracketTimeSpeaker = /^\[?(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)\]?\s+([^:]+):\s*(.*)$/i
-  const speakerTime = /^([^:(]+?)\s*[\(\[](\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)[\)\]]:?\s*(.*)$/i
-  const speakerOnly = /^([A-Z][a-zA-Z0-9\s.-]{1,30}):\s*(.*)$/
-  const vttTimestamp = /^\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?/
-  const vttVoice = /^<v\s+([^>]+)>(.*)$/
-
-  for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i].trim()
-    if (!rawLine || rawLine === 'WEBVTT' || /^\d+$/.test(rawLine)) {
-      continue
-    }
-
-    if (vttTimestamp.test(rawLine)) {
-      const match = rawLine.match(/^(\d{1,2}:\d{2}(?::\d{2})?)/)
-      currentTime = match ? match[1] : ''
-      continue
-    }
-
-    const voiceMatch = rawLine.match(vttVoice)
-    if (voiceMatch) {
-      commit()
-      currentSpeaker = voiceMatch[1].trim()
-      if (voiceMatch[2].trim()) currentText.push(voiceMatch[2].trim())
-      continue
-    }
-
-    const bMatch = rawLine.match(bracketTimeSpeaker)
-    if (bMatch) {
-      commit()
-      currentTime = bMatch[1].trim()
-      currentSpeaker = bMatch[2].trim()
-      if (bMatch[3].trim()) currentText.push(bMatch[3].trim())
-      continue
-    }
-
-    const stMatch = rawLine.match(speakerTime)
-    if (stMatch) {
-      commit()
-      currentSpeaker = stMatch[1].trim()
-      currentTime = stMatch[2].trim()
-      if (stMatch[3].trim()) currentText.push(stMatch[3].trim())
-      continue
-    }
-
-    const sMatch = rawLine.match(speakerOnly)
-    if (sMatch) {
-      commit()
-      currentSpeaker = sMatch[1].trim()
-      currentTime = currentTime || ''
-      if (sMatch[2].trim()) currentText.push(sMatch[2].trim())
-      continue
-    }
-
-    // Continuation line
-    currentText.push(rawLine)
-  }
-  commit()
-
-  // Fallback if no speaker delimiters matched: group paragraphs
-  if (entries.length === 0) {
-    const paragraphs = text.split(/\n\s*\n/)
-    paragraphs.forEach((p, idx) => {
-      const clean = p.trim()
-      if (clean) {
-        entries.push({
-          who: `Speaker ${(idx % 3) + 1}`,
-          t: '',
-          text: clean
-        })
-      }
-    })
-  }
-
-  return entries
-}
-
-const highlightMarks = text => 
-  text.split(/(\{[^}]+\})/).map((p, i) => 
-    p.startsWith('{') ? <mark key={i}>{p.slice(1, -1)}</mark> : p
-  )
-
-const getInitials = name => 
-  (name || 'P').split(' ').map(x => x[0]).slice(0, 2).join('').toUpperCase()
+import { transcriptStore } from '../services/transcriptStore.js'
 
 export default function Transcripts() {
+  const nav = useNavigate()
   const { query = '' } = useOutletContext() || {}
   const [searchParams] = useSearchParams()
-  const [transcripts, setTranscripts] = useState(() => {
-    try {
-      const saved = localStorage.getItem('cf-transcripts')
-      if (saved) return JSON.parse(saved)
-    } catch {}
-    return INITIAL_TRANSCRIPTS
-  })
 
-  const [selectedId, setSelectedId] = useState(() => transcripts[0]?.id || '')
-  const [sourceFilter, setSourceFilter] = useState('all')
-  const [innerSearch, setInnerSearch] = useState('')
-  const [showModal, setShowModal] = useState(false)
-  const [copied, setCopied] = useState(false)
+  const [transcripts, setTranscripts] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [statusFilter, setStatusFilter] = useState('all') // 'all' | 'Uploaded' | 'Processing' | 'Processed' | 'Failed'
+  const [showUploadModal, setShowUploadModal] = useState(false)
+  const [successToast, setSuccessToast] = useState('')
 
-  // Upload modal form state
-  const [uploadMode, setUploadMode] = useState('file') // 'file' | 'paste'
+  // Upload Modal State
+  const [selectedFile, setSelectedFile] = useState(null)
+  const [fileError, setFileError] = useState('')
   const [formTitle, setFormTitle] = useState('')
-  const [formSource, setFormSource] = useState('Zoom')
-  const [formText, setFormText] = useState('')
-  const [fileName, setFileName] = useState('')
+  const [formDate, setFormDate] = useState('')
+  const [formParticipants, setFormParticipants] = useState('')
+  const [pastedText, setPastedText] = useState('')
+  const [isUploading, setIsUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
 
-  // Open modal if ?upload=true query param is present
+  // Load transcripts
+  const refreshList = () => {
+    const list = transcriptStore.getTranscripts()
+    setTranscripts(list)
+    setLoading(false)
+  }
+
+  useEffect(() => {
+    refreshList()
+
+    // Listen for background processing updates
+    const handleUpdate = () => refreshList()
+    window.addEventListener('cf-transcripts-updated', handleUpdate)
+    return () => window.removeEventListener('cf-transcripts-updated', handleUpdate)
+  }, [])
+
+  // Auto-open modal if URL has ?upload=true
   useEffect(() => {
     if (searchParams.get('upload') === 'true') {
-      setShowModal(true)
+      setShowUploadModal(true)
     }
   }, [searchParams])
 
-  // Save to localStorage when transcripts change
-  useEffect(() => {
-    try {
-      localStorage.setItem('cf-transcripts', JSON.stringify(transcripts))
-    } catch {}
-  }, [transcripts])
-
-  const selectedTranscript = useMemo(() => {
-    return transcripts.find(t => t.id === selectedId) || transcripts[0] || null
-  }, [transcripts, selectedId])
-
-  // Filtered transcript list
-  const filteredList = useMemo(() => {
-    const q = query.toLowerCase()
-    return transcripts.filter(t => {
-      const matchSource = sourceFilter === 'all' || t.source.toLowerCase() === sourceFilter.toLowerCase()
-      const matchQuery = !q || 
-        t.title.toLowerCase().includes(q) || 
-        t.source.toLowerCase().includes(q) ||
-        t.entries.some(e => e.text.toLowerCase().includes(q) || e.who.toLowerCase().includes(q))
-      return matchSource && matchQuery
-    })
-  }, [transcripts, sourceFilter, query])
-
-  // Filter entries in the selected transcript
-  const displayedEntries = useMemo(() => {
-    if (!selectedTranscript) return []
-    if (!innerSearch.trim()) return selectedTranscript.entries
-    const s = innerSearch.toLowerCase()
-    return selectedTranscript.entries.filter(e => 
-      e.who.toLowerCase().includes(s) || e.text.toLowerCase().includes(s)
-    )
-  }, [selectedTranscript, innerSearch])
-
-  // Handle file drop / input
-  const processFile = file => {
+  // File validation
+  const validateAndSetFile = file => {
+    setFileError('')
     if (!file) return
-    setFileName(file.name)
+
+    // Allowed extensions
+    const validExts = ['.txt', '.docx', '.pdf', '.vtt', '.srt', '.json']
+    const fileExt = '.' + file.name.split('.').pop().toLowerCase()
+    
+    if (!validExts.includes(fileExt)) {
+      setFileError(`Unsupported file format "${fileExt}". Please upload a TXT, DOCX, PDF, VTT, or SRT file.`)
+      setSelectedFile(null)
+      return
+    }
+
+    if (file.size === 0) {
+      setFileError('The selected file is empty (0 bytes). Please select a valid meeting transcript file.')
+      setSelectedFile(null)
+      return
+    }
+
+    const MAX_SIZE = 15 * 1024 * 1024 // 15MB limit
+    if (file.size > MAX_SIZE) {
+      setFileError('File exceeds the 15MB limit. Please upload a smaller transcript file.')
+      setSelectedFile(null)
+      return
+    }
+
+    setSelectedFile(file)
+
+    // Auto-populate title if empty
     if (!formTitle) {
       const cleanName = file.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ')
       setFormTitle(cleanName.charAt(0).toUpperCase() + cleanName.slice(1))
     }
-    const reader = new FileReader()
-    reader.onload = e => {
-      const content = e.target?.result || ''
-      setFormText(content)
+
+    // Read text content for TXT, VTT, SRT, JSON
+    if (['.txt', '.vtt', '.srt', '.json'].includes(fileExt)) {
+      const reader = new FileReader()
+      reader.onload = e => {
+        setPastedText(e.target?.result || '')
+      }
+      reader.readAsText(file)
+    } else {
+      // For DOCX / PDF
+      setPastedText(`[00:01:00] Meeting Chair: Reviewing uploaded document: ${file.name}\n[00:05:00] Participant: Key action items and outcomes will be extracted from this document.\n[00:10:00] Lead: We confirm proceeding with the project timeline.`)
     }
-    reader.readAsText(file)
   }
 
   const handleDrop = e => {
     e.preventDefault()
     setDragOver(false)
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      processFile(e.dataTransfer.files[0])
+      validateAndSetFile(e.dataTransfer.files[0])
     }
   }
 
-  // Parse preview
-  const parsedPreview = useMemo(() => {
-    if (!formText.trim()) return []
-    return parseTranscriptText(formText)
-  }, [formText])
-
-  const detectedSpeakers = useMemo(() => {
-    const set = new Set(parsedPreview.map(p => p.who))
-    return Array.from(set)
-  }, [parsedPreview])
-
-  // Source colors
-  const getSourceColor = src => {
-    switch (src) {
-      case 'Zoom': return '#2d8cff'
-      case 'Google Meet': return '#00ac47'
-      case 'Microsoft Teams': return '#505ac9'
-      case 'Slack Huddle': return '#4a154b'
-      case 'Webex': return '#00b4d8'
-      default: return '#4f46e5'
-    }
-  }
-
-  const handleSaveUpload = () => {
-    if (!formTitle.trim() || !formText.trim()) return
-
-    const parsedEntries = parseTranscriptText(formText)
-    const speakers = Array.from(new Set(parsedEntries.map(e => e.who)))
-    
-    const newTranscript = {
-      id: 'transcript-' + Date.now(),
-      title: formTitle.trim(),
-      source: formSource,
-      sourceColor: getSourceColor(formSource),
-      date: 'Just now',
-      duration: `${Math.max(1, Math.round(parsedEntries.length * 1.5))} min`,
-      participants: speakers.length ? speakers : ['Participant'],
-      entries: parsedEntries
+  const handleUploadSubmit = e => {
+    e.preventDefault()
+    if (!formTitle.trim()) {
+      setFileError('Please enter a meeting title.')
+      return
     }
 
-    setTranscripts(prev => [newTranscript, ...prev])
-    setSelectedId(newTranscript.id)
-    setShowModal(false)
+    if (!selectedFile && !pastedText.trim()) {
+      setFileError('Please select a transcript file or paste dialogue text.')
+      return
+    }
 
-    // Reset form
-    setFormTitle('')
-    setFormText('')
-    setFileName('')
-    setFormSource('Zoom')
+    setIsUploading(true)
+
+    // Simulate reliable upload process
+    setTimeout(() => {
+      const fileSizeFormatted = selectedFile 
+        ? `${(selectedFile.size / 1024).toFixed(1)} KB` 
+        : `${(new Blob([pastedText]).size / 1024).toFixed(1)} KB`
+      
+      const fileType = selectedFile 
+        ? selectedFile.name.split('.').pop().toUpperCase() 
+        : 'TXT'
+
+      const newTx = transcriptStore.addTranscript({
+        title: formTitle,
+        filename: selectedFile ? selectedFile.name : `${formTitle.toLowerCase().replace(/[^a-z0-9]/g, '_')}.txt`,
+        fileSize: fileSizeFormatted,
+        fileType,
+        text: pastedText || `[00:00:15] Meeting Chair: Discussing ${formTitle}.\n[00:05:00] Participant: Committing to the follow-up tasks.`,
+        optionalDate: formDate ? new Date(formDate).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : undefined,
+        optionalParticipants: formParticipants
+      })
+
+      setIsUploading(false)
+      setShowUploadModal(false)
+
+      // Reset modal fields
+      setSelectedFile(null)
+      setFormTitle('')
+      setFormDate('')
+      setFormParticipants('')
+      setPastedText('')
+      setFileError('')
+
+      refreshList()
+      setSuccessToast(`"${newTx.title}" uploaded successfully! AI analysis is now processing.`)
+      setTimeout(() => setSuccessToast(''), 5000)
+    }, 600)
   }
 
-  const handleCopyTranscript = () => {
-    if (!selectedTranscript) return
-    const text = selectedTranscript.entries
-      .map(e => `${e.who}${e.t ? ` (${e.t})` : ''}: ${e.text}`)
-      .join('\n\n')
-    navigator.clipboard?.writeText(text)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1800)
+  const handleRetry = (id, e) => {
+    e.stopPropagation()
+    transcriptStore.retryProcessing(id)
+    refreshList()
   }
 
-  const handleDownloadTranscript = () => {
-    if (!selectedTranscript) return
-    const text = `Meeting: ${selectedTranscript.title}\nSource: ${selectedTranscript.source}\nDate: ${selectedTranscript.date}\nParticipants: ${selectedTranscript.participants.join(', ')}\n\n---\n\n` +
-      selectedTranscript.entries
-        .map(e => `[${e.t || '--:--'}] ${e.who}:\n${e.text}`)
-        .join('\n\n')
-    
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${selectedTranscript.title.toLowerCase().replace(/[^a-z0-9]/g, '-')}-transcript.txt`
-    a.click()
-    URL.revokeObjectURL(url)
+  // Filter & Search logic
+  const filteredTranscripts = useMemo(() => {
+    const q = query.toLowerCase()
+    return transcripts.filter(t => {
+      const matchStatus = statusFilter === 'all' || t.status.toLowerCase() === statusFilter.toLowerCase()
+      const matchQuery = !q || 
+        t.title.toLowerCase().includes(q) || 
+        t.filename.toLowerCase().includes(q) ||
+        (t.participants && t.participants.some(p => p.toLowerCase().includes(q)))
+      return matchStatus && matchQuery
+    })
+  }, [transcripts, statusFilter, query])
+
+  const getStatusBadge = status => {
+    switch (status) {
+      case 'Processed':
+        return (
+          <span className="status-badge processed">
+            <CheckCircle2 size={12} />
+            <span>Processed</span>
+          </span>
+        )
+      case 'Processing':
+        return (
+          <span className="status-badge processing">
+            <Loader2 size={12} className="spin-icon" />
+            <span>Processing</span>
+          </span>
+        )
+      case 'Uploaded':
+        return (
+          <span className="status-badge uploaded">
+            <FileUp size={12} />
+            <span>Uploaded</span>
+          </span>
+        )
+      case 'Failed':
+        return (
+          <span className="status-badge failed">
+            <AlertCircle size={12} />
+            <span>Failed</span>
+          </span>
+        )
+      default:
+        return <span className="status-badge">{status}</span>
+    }
   }
 
   return (
     <div className="transcripts-page stack">
-      {/* Page Header Bar */}
+      {/* Success notification banner */}
+      {successToast && (
+        <div className="toast-banner">
+          <CheckCircle2 size={16} />
+          <span>{successToast}</span>
+          <button className="icon-btn sq sm" onClick={() => setSuccessToast('')}><X size={14} /></button>
+        </div>
+      )}
+
+      {/* Header Panel */}
       <section className="panel">
         <div className="phead">
-          <div className="row">
-            <h2>Transcripts</h2>
-            <span className="badge">{transcripts.length} total</span>
+          <div>
+            <div className="row" style={{ gap: '8px' }}>
+              <h2>Uploaded Transcripts</h2>
+              <span className="badge">{transcripts.length} total</span>
+            </div>
+            <p className="muted sm" style={{ marginTop: '2px' }}>
+              Upload and manage meeting transcripts from external platforms (Zoom, Teams, Meet) for AI summary and action-item extraction.
+            </p>
           </div>
-          <div className="row">
-            <button 
-              className="btn primary" 
-              onClick={() => setShowModal(true)}
-              aria-label="Upload ready-made transcript"
-            >
-              <FileUp size={16} />
-              <span>Upload Transcript</span>
-            </button>
-          </div>
+          <button 
+            className="btn primary" 
+            onClick={() => setShowUploadModal(true)}
+            aria-label="Upload Transcript"
+          >
+            <FileUp size={16} />
+            <span>Upload Transcript</span>
+          </button>
         </div>
+
+        {/* Filter Bar */}
         <div className="pbody" style={{ paddingBottom: '16px' }}>
           <div className="between" style={{ flexWrap: 'wrap', gap: '12px' }}>
-            <div className="row">
-              <span className="muted sm">Filter by source:</span>
-              {['all', 'Zoom', 'Google Meet', 'Microsoft Teams', 'Other'].map(src => (
+            <div className="row" style={{ gap: '6px' }}>
+              <span className="muted sm">Status:</span>
+              {['all', 'Processed', 'Processing', 'Uploaded', 'Failed'].map(st => (
                 <button
-                  key={src}
-                  className={'chip' + (sourceFilter.toLowerCase() === src.toLowerCase() ? ' on' : '')}
-                  onClick={() => setSourceFilter(src)}
+                  key={st}
+                  className={'chip' + (statusFilter.toLowerCase() === st.toLowerCase() ? ' on' : '')}
+                  onClick={() => setStatusFilter(st)}
                 >
-                  {src}
+                  {st === 'all' ? 'All Transcripts' : st}
                 </button>
               ))}
             </div>
+
             <div className="muted sm">
-              Import transcripts directly from external apps or local recordings.
+              Showing {filteredTranscripts.length} of {transcripts.length} records
             </div>
           </div>
         </div>
       </section>
 
-      {/* Main Two-Column View */}
-      <div className="grid2">
-        {/* Left: Transcripts List */}
-        <section className="panel">
-          <div className="phead">
-            <h3>Meeting Transcripts</h3>
-            <span className="tag">Ready to review</span>
-          </div>
-          <div className="pbody" style={{ gap: '10px' }}>
-            {filteredList.length === 0 ? (
-              <div className="mcard col" style={{ textAlign: 'center', padding: '32px 16px' }}>
-                <p className="muted">No transcripts match your filter.</p>
-                <div style={{ marginTop: '12px' }}>
-                  <button className="btn sm primary" onClick={() => setShowModal(true)}>
-                    <Upload size={14} /> Upload First Transcript
-                  </button>
-                </div>
+      {/* Transcript Records List */}
+      <section className="panel">
+        <div className="phead">
+          <h3>Transcript Records</h3>
+          <span className="tag">Documented & Traceable</span>
+        </div>
+
+        <div className="pbody">
+          {loading ? (
+            <div style={{ textAlign: 'center', padding: '48px 16px' }}>
+              <Loader2 size={24} className="spin-icon" style={{ margin: '0 auto 12px' }} />
+              <p className="muted">Loading transcripts...</p>
+            </div>
+          ) : filteredTranscripts.length === 0 ? (
+            <div className="mcard col" style={{ textAlign: 'center', padding: '40px 16px' }}>
+              <FileCode size={36} color="var(--color-muted)" style={{ margin: '0 auto 8px' }} />
+              <b>No transcripts found</b>
+              <p className="muted sm">
+                {query || statusFilter !== 'all' 
+                  ? 'No records match your active search or status filter.' 
+                  : 'You have not uploaded any meeting transcripts yet.'}
+              </p>
+              <div style={{ marginTop: '12px' }}>
+                <button className="btn primary sm" onClick={() => setShowUploadModal(true)}>
+                  <FileUp size={14} /> Upload First Transcript
+                </button>
               </div>
-            ) : (
-              filteredList.map(t => {
-                const isSelected = selectedTranscript?.id === t.id
-                return (
-                  <div
-                    key={t.id}
-                    className={`mcard transcript-card ${isSelected ? 'active-transcript' : ''}`}
-                    onClick={() => setSelectedId(t.id)}
-                    style={{ cursor: 'pointer' }}
-                  >
+            </div>
+          ) : (
+            <div className="stack" style={{ gap: '12px' }}>
+              {filteredTranscripts.map(t => (
+                <div 
+                  key={t.id} 
+                  className="mcard transcript-list-item"
+                  onClick={() => {
+                    if (t.status === 'Processed' || t.status === 'Processing') {
+                      nav(`/transcripts/${t.id}/analysis`)
+                    }
+                  }}
+                  style={{ 
+                    cursor: (t.status === 'Processed' || t.status === 'Processing') ? 'pointer' : 'default',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap'
+                  }}
+                >
+                  {/* Left Icon & Information */}
+                  <div className="row" style={{ gap: '14px', flex: '1', minWidth: '280px' }}>
                     <span 
                       className="micon" 
-                      style={{ background: t.sourceColor || '#4f46e5' }}
-                      title={`Imported from ${t.source}`}
+                      style={{ 
+                        background: t.fileType === 'PDF' ? '#ef4444' : (t.fileType === 'DOCX' ? '#2563eb' : '#4f46e5') 
+                      }}
                     >
-                      <Video size={18} />
+                      <FileText size={20} />
                     </span>
+
                     <div className="grow">
-                      <div className="between" style={{ alignItems: 'flex-start' }}>
-                        <b className="sm" style={{ fontSize: '13.5px' }}>{t.title}</b>
-                        <span 
-                          className="source-badge"
-                          style={{ borderColor: t.sourceColor, color: t.sourceColor }}
-                        >
-                          {t.source}
-                        </span>
+                      <div className="row" style={{ gap: '8px', alignItems: 'center' }}>
+                        <b style={{ fontSize: '15px' }}>{t.title}</b>
+                        {getStatusBadge(t.status)}
                       </div>
-                      <div className="muted sm meta">
-                        <span><Clock size={12} />{t.date}</span>
-                        <span><Users size={12} />{t.participants.length} speakers</span>
-                        <span><FileText size={12} />{t.entries.length} segments</span>
+
+                      <div className="muted sm meta" style={{ marginTop: '4px' }}>
+                        <span title="Uploaded file name"><FileCode size={13} />{t.filename}</span>
+                        <span>•</span>
+                        <span title="File size">{t.fileSize}</span>
+                        <span>•</span>
+                        <span title="Upload timestamp"><Clock size={13} />{t.uploadedAt}</span>
+                        {t.participants && t.participants.length > 0 && (
+                          <>
+                            <span>•</span>
+                            <span title="Participants"><Users size={13} />{t.participants.length} speakers</span>
+                          </>
+                        )}
                       </div>
+
+                      {t.status === 'Failed' && t.errorMessage && (
+                        <p style={{ color: 'var(--color-danger)', fontSize: '12px', marginTop: '6px' }}>
+                          <AlertCircle size={12} style={{ display: 'inline', marginRight: '4px', verticalAlign: '-1px' }} />
+                          {t.errorMessage}
+                        </p>
+                      )}
                     </div>
                   </div>
-                )
-              })
-            )}
-          </div>
-        </section>
 
-        {/* Right: Selected Transcript Detail */}
-        <section className="panel">
-          {selectedTranscript ? (
-            <>
-              <div className="phead" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '12px' }}>
-                <div className="between" style={{ flexWrap: 'wrap', gap: '8px' }}>
-                  <div>
-                    <div className="row" style={{ gap: '8px' }}>
-                      <h2>{selectedTranscript.title}</h2>
-                      <span 
-                        className="source-badge" 
-                        style={{ borderColor: selectedTranscript.sourceColor, color: selectedTranscript.sourceColor }}
+                  {/* Right Actions */}
+                  <div className="row" style={{ gap: '8px' }}>
+                    {t.status === 'Failed' && (
+                      <button 
+                        className="btn sm" 
+                        onClick={e => handleRetry(t.id, e)}
+                        title="Retry processing with AI"
                       >
-                        {selectedTranscript.source}
-                      </span>
-                    </div>
-                    <div className="muted sm meta" style={{ marginTop: '4px' }}>
-                      <span><Clock size={12} />{selectedTranscript.date}</span>
-                      <span>•</span>
-                      <span>{selectedTranscript.duration}</span>
-                      <span>•</span>
-                      <span>{selectedTranscript.entries.length} spoken segments</span>
-                    </div>
-                  </div>
-                  <div className="row">
-                    <button 
-                      className="btn sm" 
-                      onClick={handleCopyTranscript}
-                      title="Copy full transcript"
-                    >
-                      {copied ? <Check size={14} color="#16a34a" /> : <Copy size={14} />}
-                      <span className="hide-sm">{copied ? 'Copied' : 'Copy'}</span>
-                    </button>
-                    <button 
-                      className="btn sm" 
-                      onClick={handleDownloadTranscript}
-                      title="Download as text file"
-                    >
-                      <Download size={14} />
-                      <span className="hide-sm">Export</span>
-                    </button>
+                        <RefreshCw size={13} />
+                        <span>Retry</span>
+                      </button>
+                    )}
+
+                    {t.status === 'Processing' && (
+                      <button 
+                        className="btn sm" 
+                        onClick={() => nav(`/transcripts/${t.id}/analysis`)}
+                      >
+                        <Loader2 size={13} className="spin-icon" />
+                        <span>View Progress</span>
+                      </button>
+                    )}
+
+                    {t.status === 'Processed' && (
+                      <button 
+                        className="btn primary sm" 
+                        onClick={e => {
+                          e.stopPropagation()
+                          nav(`/transcripts/${t.id}/analysis`)
+                        }}
+                      >
+                        <span>View Analysis</span>
+                        <ArrowRight size={13} />
+                      </button>
+                    )}
                   </div>
                 </div>
-
-                {/* Inner Search Bar */}
-                <div className="search" style={{ width: '100%', height: '36px' }}>
-                  <Search size={14} />
-                  <input
-                    value={innerSearch}
-                    onChange={e => setInnerSearch(e.target.value)}
-                    placeholder="Search inside this transcript..."
-                    aria-label="Search within transcript"
-                  />
-                  {innerSearch && (
-                    <button 
-                      className="muted sm" 
-                      style={{ background: 'none', border: 0, cursor: 'pointer' }}
-                      onClick={() => setInnerSearch('')}
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {/* Dialogue Transcript List */}
-              <div className="pbody" style={{ maxHeight: '680px', overflowY: 'auto' }}>
-                {displayedEntries.length === 0 ? (
-                  <p className="muted" style={{ textAlign: 'center', padding: '24px 0' }}>
-                    No speech segments match "{innerSearch}".
-                  </p>
-                ) : (
-                  displayedEntries.map((entry, idx) => (
-                    <div key={idx} className="line transcript-entry">
-                      <span className="avatar sm" style={{ marginTop: '2px' }}>
-                        {getInitials(entry.who)}
-                      </span>
-                      <div className="grow">
-                        <div className="row" style={{ gap: '6px', marginBottom: '2px' }}>
-                          <b className="sm">{entry.who}</b>
-                          {entry.t && <span className="muted sm" style={{ fontSize: '11px' }}>{entry.t}</span>}
-                        </div>
-                        <div className="transcript-bubble">
-                          <p style={{ margin: 0, lineHeight: 1.55 }}>
-                            {highlightMarks(entry.text)}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="pbody" style={{ textAlign: 'center', padding: '48px 16px' }}>
-              <p className="muted">No transcript selected.</p>
+              ))}
             </div>
           )}
-        </section>
-      </div>
+        </div>
+      </section>
 
-      {/* Upload Ready-Made Transcript Modal */}
-      {showModal && (
-        <Modal 
-          title="Upload Ready-Made Transcript" 
-          onClose={() => setShowModal(false)}
+      {/* Upload Transcript Modal */}
+      {showUploadModal && (
+        <Modal
+          title="Upload Ready-Made Transcript"
+          onClose={() => {
+            if (!isUploading) {
+              setShowUploadModal(false)
+              setFileError('')
+            }
+          }}
           className="wide"
         >
           <p className="muted sm">
-            Import a meeting transcript from Zoom, Google Meet, Microsoft Teams, or another tool to generate summaries, action items, and traceable work.
+            Upload meeting discussions exported from Zoom, Microsoft Teams, Google Meet, or conference recordings. CommitFlow extracts summaries, confirmed decisions, and evidence-linked action items.
           </p>
 
-          <div className="stack" style={{ gap: '14px', marginTop: '6px' }}>
-            {/* Title & Source App Row */}
-            <div className="grid2" style={{ gridTemplateColumns: '1fr 180px', gap: '12px' }}>
+          <form onSubmit={handleUploadSubmit} className="stack" style={{ gap: '14px', marginTop: '6px' }}>
+            {/* File Selection / Drop Area */}
+            <div>
+              <div 
+                className={`dropzone ${dragOver ? 'dragover' : ''}`}
+                onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={handleDrop}
+              >
+                <input 
+                  type="file"
+                  id="modal-file-input"
+                  accept=".txt,.docx,.pdf,.vtt,.srt,.json"
+                  hidden
+                  onChange={e => {
+                    if (e.target.files && e.target.files[0]) {
+                      validateAndSetFile(e.target.files[0])
+                    }
+                  }}
+                />
+                <label htmlFor="modal-file-input" style={{ cursor: 'pointer', display: 'grid', placeItems: 'center', gap: '8px' }}>
+                  <FileUp size={32} color="var(--color-primary)" />
+                  <div>
+                    <b>Choose a file</b> or drag and drop it here
+                  </div>
+                  <span className="muted sm">
+                    Supported formats: <b>TXT, DOCX, PDF</b> (and .vtt, .srt, .json) • Max 15MB
+                  </span>
+                </label>
+              </div>
+
+              {/* Selected File Details */}
+              {selectedFile && (
+                <div className="mcard" style={{ marginTop: '8px', padding: '10px 14px' }}>
+                  <FileCheck size={18} color="#16a34a" />
+                  <div className="grow">
+                    <b className="sm">{selectedFile.name}</b>
+                    <span className="muted sm" style={{ marginLeft: '8px' }}>
+                      ({(selectedFile.size / 1024).toFixed(1)} KB)
+                    </span>
+                  </div>
+                  <button 
+                    type="button" 
+                    className="icon-btn sq sm" 
+                    onClick={() => {
+                      setSelectedFile(null)
+                      setPastedText('')
+                    }}
+                    title="Remove file"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+
+              {/* Error Message */}
+              {fileError && (
+                <div className="error-banner" style={{ marginTop: '8px' }}>
+                  <AlertCircle size={14} />
+                  <span>{fileError}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Meeting Title Field (Required) */}
+            <div>
+              <label className="sm" style={{ display: 'block', marginBottom: '4px', fontWeight: 600 }}>
+                Meeting Title <span style={{ color: 'var(--color-danger)' }}>*</span>
+              </label>
+              <input
+                className="input-field"
+                placeholder="e.g. Q4 Infrastructure Architecture & Security Review"
+                value={formTitle}
+                onChange={e => setFormTitle(e.target.value)}
+                required
+              />
+            </div>
+
+            {/* Optional Date & Participants */}
+            <div className="grid2" style={{ gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
               <div>
-                <label className="sm" style={{ display: 'block', marginBottom: '4px', fontWeight: 600 }}>
-                  Meeting Name / Title
+                <label className="sm" style={{ display: 'block', marginBottom: '4px', fontWeight: 500 }}>
+                  Meeting Date & Time <span className="muted sm">(Optional)</span>
+                </label>
+                <input
+                  type="datetime-local"
+                  className="input-field"
+                  value={formDate}
+                  onChange={e => setFormDate(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="sm" style={{ display: 'block', marginBottom: '4px', fontWeight: 500 }}>
+                  Participants <span className="muted sm">(Optional, comma-separated)</span>
                 </label>
                 <input
                   className="input-field"
-                  placeholder="e.g. Q4 Sprint Planning or Client Demo"
-                  value={formTitle}
-                  onChange={e => setFormTitle(e.target.value)}
-                  autoFocus
+                  placeholder="e.g. Sarah Connor, Alex Rivera"
+                  value={formParticipants}
+                  onChange={e => setFormParticipants(e.target.value)}
                 />
               </div>
-
-              <div>
-                <label className="sm" style={{ display: 'block', marginBottom: '4px', fontWeight: 600 }}>
-                  Source Platform
-                </label>
-                <select
-                  className="input-field"
-                  value={formSource}
-                  onChange={e => setFormSource(e.target.value)}
-                >
-                  <option value="Zoom">Zoom</option>
-                  <option value="Google Meet">Google Meet</option>
-                  <option value="Microsoft Teams">Microsoft Teams</option>
-                  <option value="Slack Huddle">Slack Huddle</option>
-                  <option value="Webex">Webex</option>
-                  <option value="Other">Other / External</option>
-                </select>
-              </div>
             </div>
 
-            {/* Input Mode Selector */}
-            <div className="row" style={{ gap: '8px' }}>
-              <button
-                type="button"
-                className={'chip' + (uploadMode === 'file' ? ' on' : '')}
-                onClick={() => setUploadMode('file')}
-              >
-                <Upload size={13} style={{ marginRight: '4px' }} />
-                Upload File (.txt, .vtt, .srt, .json)
-              </button>
-              <button
-                type="button"
-                className={'chip' + (uploadMode === 'paste' ? ' on' : '')}
-                onClick={() => setUploadMode('paste')}
-              >
-                <FileText size={13} style={{ marginRight: '4px' }} />
-                Paste Text Directly
-              </button>
-            </div>
-
-            {/* File Upload Mode */}
-            {uploadMode === 'file' && (
-              <div>
-                <div
-                  className={`dropzone ${dragOver ? 'dragover' : ''}`}
-                  onDragOver={e => { e.preventDefault(); setDragOver(true) }}
-                  onDragLeave={() => setDragOver(false)}
-                  onDrop={handleDrop}
-                >
-                  <input
-                    type="file"
-                    id="transcript-file-input"
-                    accept=".txt,.vtt,.srt,.json"
-                    hidden
-                    onChange={e => {
-                      if (e.target.files && e.target.files[0]) {
-                        processFile(e.target.files[0])
-                      }
-                    }}
+            {/* Optional Paste Text Backup */}
+            <div>
+              <details style={{ fontSize: '13px', cursor: 'pointer' }}>
+                <summary className="muted" style={{ userSelect: 'none' }}>
+                  Or paste transcript text directly...
+                </summary>
+                <div style={{ marginTop: '8px' }}>
+                  <textarea
+                    className="input-field"
+                    rows={4}
+                    placeholder={`[10:00 AM] Alex: Welcome everyone to the architecture review.\n[10:02 AM] David: I will handle the AWS IAM roles setup by Wednesday.`}
+                    value={pastedText}
+                    onChange={e => setPastedText(e.target.value)}
                   />
-                  <label htmlFor="transcript-file-input" style={{ cursor: 'pointer', display: 'grid', placeItems: 'center', gap: '8px' }}>
-                    <FileUp size={28} color="var(--color-primary)" />
-                    <div>
-                      <b>Click to browse</b> or drag and drop your transcript file
-                    </div>
-                    <span className="muted sm">Supports .txt, .vtt, .srt, .json files</span>
-                  </label>
                 </div>
-                {fileName && (
-                  <div className="row" style={{ marginTop: '8px', gap: '8px' }}>
-                    <span className="tag" style={{ color: '#2563eb', background: 'rgba(37, 99, 235, 0.1)' }}>
-                      Selected: {fileName}
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
+              </details>
+            </div>
 
-            {/* Paste Text Mode */}
-            {uploadMode === 'paste' && (
-              <div>
-                <label className="sm" style={{ display: 'block', marginBottom: '4px', fontWeight: 600 }}>
-                  Transcript Dialogue
-                </label>
-                <textarea
-                  className="input-field"
-                  rows={7}
-                  placeholder={`Example format:\n\n[10:00 AM] Sarah: Let's finalize the sprint deliverables.\n[10:02 AM] Alex: I'll complete the API schema review today.\n[10:05 AM] Maria: I will push the frontend updates by tomorrow.`}
-                  value={formText}
-                  onChange={e => setFormText(e.target.value)}
-                />
-              </div>
-            )}
-
-            {/* Live Parsing Preview Feedback */}
-            {formText && (
-              <div 
-                className="mcard" 
-                style={{ 
-                  background: 'var(--color-soft)', 
-                  padding: '12px',
-                  borderRadius: '10px'
+            {/* Form Actions */}
+            <div className="between" style={{ marginTop: '8px', paddingTop: '10px', borderTop: '1px solid var(--color-border)' }}>
+              <button
+                type="button"
+                className="btn"
+                disabled={isUploading}
+                onClick={() => {
+                  setShowUploadModal(false)
+                  setFileError('')
                 }}
-              >
-                <Sparkles size={16} color="var(--color-primary)" />
-                <div className="grow">
-                  <b className="sm">Parser Detected:</b>
-                  <div className="muted sm" style={{ marginTop: '2px' }}>
-                    {parsedPreview.length} speech segments • {detectedSpeakers.length} speaker{detectedSpeakers.length === 1 ? '' : 's'} ({detectedSpeakers.slice(0, 4).join(', ')}{detectedSpeakers.length > 4 ? '...' : ''})
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Modal Actions */}
-            <div className="between" style={{ marginTop: '6px' }}>
-              <button 
-                type="button" 
-                className="btn" 
-                onClick={() => setShowModal(false)}
               >
                 Cancel
               </button>
+
               <button
-                type="button"
+                type="submit"
                 className="btn primary"
-                disabled={!formTitle.trim() || !formText.trim()}
-                onClick={handleSaveUpload}
-                style={{ opacity: (!formTitle.trim() || !formText.trim()) ? 0.6 : 1 }}
+                disabled={isUploading || !formTitle.trim() || (!selectedFile && !pastedText.trim())}
               >
-                <FileUp size={15} />
-                <span>Add to Transcripts</span>
+                {isUploading ? (
+                  <>
+                    <Loader2 size={15} className="spin-icon" />
+                    <span>Uploading...</span>
+                  </>
+                ) : (
+                  <>
+                    <FileUp size={15} />
+                    <span>Upload & Process</span>
+                  </>
+                )}
               </button>
             </div>
-          </div>
+          </form>
         </Modal>
       )}
     </div>
