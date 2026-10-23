@@ -7,6 +7,8 @@ import os
 import threading
 import logging
 import uuid
+from functools import wraps
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -26,8 +28,55 @@ logger = logging.getLogger("commitflow.server")
 DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dist"))
 
 app = Flask(__name__, static_folder=None)
-# Enable CORS for frontend requests
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Enable CORS with credentials for React Vite frontend and backend
+CORS(app, supports_credentials=True, resources={
+    r"/api/*": {
+        "origins": [
+            "http://localhost:5173", 
+            "http://127.0.0.1:5173", 
+            "http://localhost:5000", 
+            "http://127.0.0.1:5000",
+            "http://localhost:3000"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+def get_current_user():
+    """Extract and validate current authenticated user from session cookie or Authorization header."""
+    token = request.cookies.get("cf_session")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+    if not token:
+        return None
+    return db.get_session_user(token)
+
+def require_auth(f):
+    """Route decorator requiring valid authenticated session."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Unauthorized. Please log in to continue."}), 401
+        request.current_user = user
+        return f(*args, **kwargs)
+    return decorated_function
+
+def require_admin(f):
+    """Route decorator requiring active administrator role."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Unauthorized. Please log in to continue."}), 401
+        if user.get("role") != "admin":
+            return jsonify({"error": "Forbidden. Administrator privileges required."}), 403
+        request.current_user = user
+        return f(*args, **kwargs)
+    return decorated_function
 
 # In-memory store fallback when PostgreSQL is not yet connected
 _mem_store = {
@@ -91,7 +140,112 @@ def process_transcript_async(tx_id, text, title):
             _mem_store["transcripts"][tx_id]["errorMessage"] = str(e)
 
 # -------------------------------------------------------------
-# REST API Endpoints
+# REST API Endpoints: Authentication
+# -------------------------------------------------------------
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    """Register a new standard user account. Always enforces role='user'."""
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip()
+    password = data.get("password", "").strip()
+    confirm_password = data.get("confirmPassword", "").strip()
+
+    if not name:
+        return jsonify({"error": "Full name is required."}), 400
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email address is required."}), 400
+    if not password:
+        return jsonify({"error": "Password is required."}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters long."}), 400
+    if confirm_password and password != confirm_password:
+        return jsonify({"error": "Passwords do not match."}), 400
+
+    # Registration safeguard: public signups MUST NEVER assign admin role
+    try:
+        user = db.create_user(name=name, email=email, password=password, role="user")
+        token, expires_at = db.create_session(user["id"])
+        
+        resp = jsonify({
+            "message": "Account created successfully.",
+            "user": user,
+            "token": token
+        })
+        resp.set_cookie(
+            "cf_session",
+            token,
+            httponly=True,
+            samesite="Lax",
+            secure=False,
+            max_age=7 * 24 * 60 * 60
+        )
+        return resp, 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        return jsonify({"error": "Failed to create account. Please try again."}), 500
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    """Authenticate existing user and establish session."""
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip()
+    password = data.get("password", "").strip()
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required."}), 400
+
+    success, msg, user = db.authenticate_user(email, password, ip_address=request.remote_addr)
+    if not success:
+        status_code = 403 if "deactivated" in msg.lower() else 401
+        return jsonify({"error": msg}), status_code
+
+    token, expires_at = db.create_session(user["id"])
+    resp = jsonify({
+        "message": "Login successful.",
+        "user": user,
+        "token": token
+    })
+    resp.set_cookie(
+        "cf_session",
+        token,
+        httponly=True,
+        samesite="Lax",
+        secure=False,
+        max_age=7 * 24 * 60 * 60
+    )
+    return resp, 200
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    """Invalidate current session and clear session cookie."""
+    token = request.cookies.get("cf_session")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+    
+    user = get_current_user()
+    if token:
+        db.delete_session(token)
+    if user:
+        db.log_audit_event(user["id"], user["email"], "USER_LOGOUT", ip_address=request.remote_addr)
+
+    resp = jsonify({"message": "Logged out successfully."})
+    resp.delete_cookie("cf_session")
+    return resp, 200
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    """Return verified session identity and permissions."""
+    user = get_current_user()
+    return jsonify({"user": user}), 200
+
+# -------------------------------------------------------------
+# REST API Endpoints: Health & Transcripts
 # -------------------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
@@ -118,11 +272,15 @@ def health_check():
 
 @app.route("/api/transcripts", methods=["GET"])
 def list_transcripts_endpoint():
-    """List all meeting transcripts."""
+    """List meeting transcripts (user's own plus demo transcripts, or all if admin)."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+
     # Try Neon PostgreSQL
     if db.get_connection_url():
         try:
-            records = db.list_transcripts()
+            records = db.list_transcripts(user_id=user_id, is_admin=is_admin)
             if records is not None:
                 return jsonify(records), 200
         except Exception as e:
@@ -135,6 +293,9 @@ def list_transcripts_endpoint():
 @app.route("/api/transcripts", methods=["POST"])
 def upload_transcript_endpoint():
     """Upload and start processing a new meeting transcript."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+
     data = request.get_json(silent=True) or {}
     title = data.get("title", "").strip()
     text = data.get("text", "").strip()
@@ -171,13 +332,14 @@ def upload_transcript_endpoint():
         "summary": None,
         "decisions": [],
         "actionItems": [],
-        "unresolvedQuestions": []
+        "unresolvedQuestions": [],
+        "userId": user_id
     }
 
     # Save to PostgreSQL
     if db.get_connection_url():
         try:
-            db.insert_transcript(tx_record)
+            db.insert_transcript(tx_record, user_id=user_id)
         except Exception as e:
             logger.error(f"Failed to insert transcript into DB: {e}")
             _mem_store["transcripts"][tx_id] = tx_record
@@ -195,11 +357,17 @@ def upload_transcript_endpoint():
 
 @app.route("/api/transcripts/<tx_id>", methods=["GET"])
 def get_transcript_endpoint(tx_id):
-    """Retrieve complete transcript details and structured analysis."""
+    """Retrieve complete transcript details with ownership check."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+
     if db.get_connection_url():
         try:
-            record = db.get_transcript_by_id(tx_id)
+            record = db.get_transcript_by_id(tx_id, user_id=user_id, is_admin=is_admin)
             if record:
+                if record.get("_forbidden"):
+                    return jsonify({"error": "Access denied. You do not have permission to view this transcript."}), 403
                 return jsonify(record), 200
         except Exception as e:
             logger.error(f"Error fetching transcript {tx_id} from DB: {e}")
@@ -242,10 +410,14 @@ def retry_transcript_endpoint(tx_id):
 
 @app.route("/api/action-items", methods=["GET"])
 def list_action_items_endpoint():
-    """Retrieve all action items across meetings."""
+    """Retrieve all action items across permitted meetings."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+
     if db.get_connection_url():
         try:
-            items = db.list_all_action_items()
+            items = db.list_all_action_items(user_id=user_id, is_admin=is_admin)
             if items is not None:
                 return jsonify(items), 200
         except Exception as e:
@@ -316,6 +488,159 @@ def edit_action_item_endpoint(action_id):
                 return jsonify({"id": action_id, "message": "Updated successfully."}), 200
 
     return jsonify({"error": "Action item not found."}), 404
+
+# -------------------------------------------------------------
+# REST API Endpoints: Administrator Panel
+# -------------------------------------------------------------
+
+@app.route("/api/admin/stats", methods=["GET"])
+@require_admin
+def admin_stats():
+    """Platform-wide database-backed statistics."""
+    stats = db.get_admin_stats()
+    if stats is None:
+        return jsonify({"error": "Unable to calculate platform statistics."}), 500
+    return jsonify(stats), 200
+
+@app.route("/api/admin/users", methods=["GET"])
+@require_admin
+def admin_users_list():
+    """List, search, and filter registered users."""
+    search = request.args.get("search", "").strip() or None
+    role = request.args.get("role", "").strip() or None
+    status = request.args.get("status", "").strip() or None
+    limit = min(int(request.args.get("limit", 100)), 200)
+    offset = int(request.args.get("offset", 0))
+
+    users = db.list_users(search=search, role=role, status=status, limit=limit, offset=offset)
+    return jsonify({"users": users}), 200
+
+@app.route("/api/admin/users/<user_id>/status", methods=["PUT"])
+@require_admin
+def admin_update_user_status(user_id):
+    """Activate or deactivate a user account with last-active-admin safeguard."""
+    data = request.get_json(silent=True) or {}
+    new_status = data.get("status")
+    if not new_status:
+        return jsonify({"error": "Status is required ('active' or 'deactivated')."}), 400
+    try:
+        db.update_user_status(user_id, new_status, actor_admin=request.current_user)
+        return jsonify({"message": f"User status updated to '{new_status}' successfully."}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error updating user status: {e}")
+        return jsonify({"error": "Failed to update user status."}), 500
+
+@app.route("/api/admin/users/<user_id>/role", methods=["PUT"])
+@require_admin
+def admin_update_user_role(user_id):
+    """Promote or demote a user role with last-active-admin safeguard."""
+    data = request.get_json(silent=True) or {}
+    new_role = data.get("role")
+    if not new_role:
+        return jsonify({"error": "Role is required ('user' or 'admin')."}), 400
+    try:
+        db.update_user_role(user_id, new_role, actor_admin=request.current_user)
+        return jsonify({"message": f"User role updated to '{new_role}' successfully."}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error updating user role: {e}")
+        return jsonify({"error": "Failed to update user role."}), 500
+
+@app.route("/api/admin/meetings", methods=["GET"])
+@require_admin
+def admin_meetings_list():
+    """Platform-wide authorized meeting metadata oversight."""
+    limit = min(int(request.args.get("limit", 50)), 100)
+    offset = int(request.args.get("offset", 0))
+    meetings = db.get_admin_meetings_overview(limit=limit, offset=offset)
+    return jsonify({"meetings": meetings}), 200
+
+@app.route("/api/admin/meetings/<meeting_id>/investigate", methods=["GET"])
+@require_admin
+def admin_investigate_meeting(meeting_id):
+    """
+    Controlled administrative inspection of sensitive meeting content for support/audit purposes.
+    Explicitly logs this access in audit_logs.
+    """
+    db.log_audit_event(
+        request.current_user["id"],
+        request.current_user["email"],
+        "ADMIN_INVESTIGATE_MEETING",
+        {"meetingId": meeting_id},
+        request.remote_addr
+    )
+    meeting = db.get_transcript_by_id(meeting_id, is_admin=True)
+    if not meeting:
+        return jsonify({"error": "Meeting transcript not found."}), 404
+    return jsonify(meeting), 200
+
+@app.route("/api/admin/audit-logs", methods=["GET"])
+@require_admin
+def admin_audit_logs():
+    """Retrieve immutable audit logs."""
+    limit = min(int(request.args.get("limit", 50)), 100)
+    offset = int(request.args.get("offset", 0))
+    action_filter = request.args.get("action", "").strip() or None
+    logs = db.list_audit_logs(limit=limit, offset=offset, action_filter=action_filter)
+    return jsonify({"logs": logs}), 200
+
+@app.route("/api/admin/system-health", methods=["GET"])
+@require_admin
+def admin_system_health():
+    """Protected health status and connectivity metrics for administrators."""
+    import platform
+    db_ok, db_msg = db.check_connection()
+    ai_ok, ai_msg = ai.check_gemini_status()
+    _, model_name = ai.get_gemini_config()
+    stats = db.get_admin_stats() or {}
+
+    return jsonify({
+        "status": "healthy" if db_ok and ai_ok else "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": {
+            "status": "connected" if db_ok else "error",
+            "message": db_msg,
+            "provider": "Neon PostgreSQL",
+            "activeAdmins": db.count_active_admins()
+        },
+        "ai": {
+            "status": "configured" if ai_ok else "unconfigured",
+            "model": model_name,
+            "provider": "Google Gemini",
+            "message": ai_msg
+        },
+        "system": {
+            "pythonVersion": platform.python_version(),
+            "os": platform.system(),
+            "totalUsers": stats.get("total_users", 0),
+            "totalMeetings": stats.get("total_meetings", 0)
+        }
+    }), 200
+
+@app.route("/api/admin/settings", methods=["GET"])
+@require_admin
+def admin_get_settings():
+    """Retrieve platform configuration settings."""
+    settings = db.get_platform_settings()
+    return jsonify({"settings": settings}), 200
+
+@app.route("/api/admin/settings", methods=["PUT"])
+@require_admin
+def admin_update_settings():
+    """Update platform configuration."""
+    data = request.get_json(silent=True) or {}
+    try:
+        db.update_platform_settings(data, actor_admin=request.current_user)
+        return jsonify({
+            "message": "Platform settings updated successfully.",
+            "settings": db.get_platform_settings()
+        }), 200
+    except Exception as e:
+        logger.error(f"Error updating settings: {e}")
+        return jsonify({"error": "Failed to update platform settings."}), 500
 
 # -------------------------------------------------------------
 # Frontend Application & Landing Page Serving

@@ -6,11 +6,14 @@ Handles connection pooling, schema migrations, and parameterized queries.
 import os
 import json
 import logging
-from datetime import datetime, timezone
+import uuid
+import secrets
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -95,6 +98,45 @@ def init_schema():
         return False
 
     schema_sql = """
+    -- 0. Users Table (RBAC: 'user' | 'admin', Status: 'active' | 'deactivated')
+    CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(64) PRIMARY KEY,
+        name VARCHAR(128) NOT NULL,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(32) NOT NULL DEFAULT 'user',
+        status VARCHAR(32) NOT NULL DEFAULT 'active',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        last_login_at TIMESTAMP WITH TIME ZONE
+    );
+
+    -- 0.1 Sessions Table
+    CREATE TABLE IF NOT EXISTS sessions (
+        id VARCHAR(128) PRIMARY KEY,
+        user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+    );
+
+    -- 0.2 Audit Logs Table
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id SERIAL PRIMARY KEY,
+        user_id VARCHAR(64),
+        user_email VARCHAR(255),
+        action VARCHAR(64) NOT NULL,
+        details JSONB DEFAULT '{}',
+        ip_address VARCHAR(64),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 0.3 Platform Settings Table
+    CREATE TABLE IF NOT EXISTS platform_settings (
+        key VARCHAR(64) PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
     -- 1. Transcripts Table
     CREATE TABLE IF NOT EXISTS transcripts (
         id VARCHAR(64) PRIMARY KEY,
@@ -109,9 +151,13 @@ def init_schema():
         participants TEXT[] DEFAULT '{}',
         raw_text TEXT NOT NULL,
         error_message TEXT,
+        user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Safe migration in case transcripts table already exists without user_id
+    ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
 
     -- 2. Meeting Summaries Table
     CREATE TABLE IF NOT EXISTS meeting_summaries (
@@ -166,6 +212,14 @@ def init_schema():
     );
 
     -- Indexes for fast filtering and status querying
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+    CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+    CREATE INDEX IF NOT EXISTS idx_transcripts_user ON transcripts(user_id);
     CREATE INDEX IF NOT EXISTS idx_transcripts_status ON transcripts(status);
     CREATE INDEX IF NOT EXISTS idx_action_items_status ON action_items(status);
     CREATE INDEX IF NOT EXISTS idx_action_items_transcript ON action_items(transcript_id);
@@ -179,6 +233,7 @@ def init_schema():
             logger.info("Neon PostgreSQL schema initialized successfully.")
         
         seed_default_data_if_empty()
+        bootstrap_admin_from_env_if_set()
         return True
     except Exception as e:
         logger.error(f"Failed to initialize schema in PostgreSQL: {e}")
@@ -188,23 +243,47 @@ def init_schema():
 # Parameterized Database Queries
 # -------------------------------------------------------------
 
-def list_transcripts():
-    """Retrieve all transcripts sorted by creation date."""
+def list_transcripts(user_id=None, is_admin=False):
+    """Retrieve transcripts sorted by creation date, filtered by user ownership or admin access."""
     if not get_connection_url():
         return None
     with get_db_cursor(commit=False) as cur:
-        cur.execute("""
-            SELECT id, title, filename, file_size as "fileSize", file_type as "fileType",
-                   source_type as "sourceType", 
-                   to_char(uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
-                   status, duration, participants, error_message as "errorMessage"
-            FROM transcripts
-            ORDER BY created_at DESC;
-        """)
+        if is_admin:
+            cur.execute("""
+                SELECT id, title, filename, file_size as "fileSize", file_type as "fileType",
+                       source_type as "sourceType", 
+                       to_char(uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
+                       status, duration, participants, user_id as "userId",
+                       error_message as "errorMessage"
+                FROM transcripts
+                ORDER BY created_at DESC;
+            """)
+        elif user_id:
+            cur.execute("""
+                SELECT id, title, filename, file_size as "fileSize", file_type as "fileType",
+                       source_type as "sourceType", 
+                       to_char(uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
+                       status, duration, participants, user_id as "userId",
+                       error_message as "errorMessage"
+                FROM transcripts
+                WHERE user_id = %s OR user_id IS NULL
+                ORDER BY created_at DESC;
+            """, (user_id,))
+        else:
+            cur.execute("""
+                SELECT id, title, filename, file_size as "fileSize", file_type as "fileType",
+                       source_type as "sourceType", 
+                       to_char(uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
+                       status, duration, participants, user_id as "userId",
+                       error_message as "errorMessage"
+                FROM transcripts
+                WHERE user_id IS NULL
+                ORDER BY created_at DESC;
+            """)
         rows = cur.fetchall()
         return [dict(r) for r in rows]
 
-def get_transcript_by_id(transcript_id):
+def get_transcript_by_id(transcript_id, user_id=None, is_admin=False):
     """Retrieve complete transcript details with summary, decisions, action items, and unresolved questions."""
     if not get_connection_url():
         return None
@@ -215,13 +294,17 @@ def get_transcript_by_id(transcript_id):
                    source_type as "sourceType", 
                    to_char(uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
                    status, duration, participants, raw_text as "transcriptText",
-                   error_message as "errorMessage"
+                   user_id as "userId", error_message as "errorMessage"
             FROM transcripts
             WHERE id = %s;
         """, (transcript_id,))
         tx = cur.fetchone()
         if not tx:
             return None
+        
+        # Access control: if transcript belongs to a user and caller is another user (and not admin)
+        if tx.get('userId') is not None and user_id is not None and tx.get('userId') != user_id and not is_admin:
+            return {"_forbidden": True}
         
         result = dict(tx)
 
@@ -298,17 +381,17 @@ def get_transcript_by_id(transcript_id):
 
         return result
 
-def insert_transcript(tx_data):
-    """Insert newly uploaded transcript into database."""
+def insert_transcript(tx_data, user_id=None):
+    """Insert newly uploaded transcript into database with user ownership."""
     if not get_connection_url():
         return None
     with get_db_cursor(commit=True) as cur:
         cur.execute("""
             INSERT INTO transcripts (
                 id, title, filename, file_size, file_type, source_type,
-                status, duration, participants, raw_text
+                status, duration, participants, raw_text, user_id
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             ) RETURNING id;
         """, (
             tx_data['id'],
@@ -320,7 +403,8 @@ def insert_transcript(tx_data):
             tx_data.get('status', 'Processing'),
             tx_data.get('duration', 'Calculating...'),
             tx_data.get('participants', []),
-            tx_data['text']
+            tx_data['text'],
+            user_id
         ))
         return tx_data['id']
 
@@ -436,20 +520,43 @@ def mark_transcript_failed(transcript_id, error_message):
         """, (error_message, transcript_id))
         return True
 
-def list_all_action_items():
-    """Retrieve all action items across all transcripts."""
+def list_all_action_items(user_id=None, is_admin=False):
+    """Retrieve all action items across permitted transcripts."""
     if not get_connection_url():
         return None
     with get_db_cursor(commit=False) as cur:
-        cur.execute("""
-            SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
-                   a.title, a.description, a.owner, a.owner_status as "ownerStatus",
-                   a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
-                   a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
-            FROM action_items a
-            JOIN transcripts t ON a.transcript_id = t.id
-            ORDER BY a.created_at DESC;
-        """)
+        if is_admin:
+            cur.execute("""
+                SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
+                       a.title, a.description, a.owner, a.owner_status as "ownerStatus",
+                       a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
+                       a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
+                FROM action_items a
+                JOIN transcripts t ON a.transcript_id = t.id
+                ORDER BY a.created_at DESC;
+            """)
+        elif user_id:
+            cur.execute("""
+                SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
+                       a.title, a.description, a.owner, a.owner_status as "ownerStatus",
+                       a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
+                       a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
+                FROM action_items a
+                JOIN transcripts t ON a.transcript_id = t.id
+                WHERE t.user_id = %s OR t.user_id IS NULL
+                ORDER BY a.created_at DESC;
+            """, (user_id,))
+        else:
+            cur.execute("""
+                SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
+                       a.title, a.description, a.owner, a.owner_status as "ownerStatus",
+                       a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
+                       a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
+                FROM action_items a
+                JOIN transcripts t ON a.transcript_id = t.id
+                WHERE t.user_id IS NULL
+                ORDER BY a.created_at DESC;
+            """)
         rows = cur.fetchall()
         items = []
         for r in rows:
@@ -583,3 +690,560 @@ def seed_default_data_if_empty():
             logger.info("Default seed data successfully populated in Neon PostgreSQL.")
     except Exception as e:
         logger.warning(f"Seeding skipped or encountered error: {e}")
+
+# -------------------------------------------------------------
+# User Authentication & RBAC Management
+# -------------------------------------------------------------
+
+def bootstrap_admin_from_env_if_set():
+    """
+    Ensure an initial administrator exists.
+    Checks environment variables (ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_NAME).
+    If no admin exists in the database, provisions a default initial admin.
+    """
+    if not get_connection_url():
+        return
+    
+    admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+    admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+    admin_name = os.getenv("ADMIN_NAME", "System Administrator").strip()
+
+    try:
+        with get_db_cursor(commit=True) as cur:
+            # If explicit credentials are provided via environment
+            if admin_email and admin_password:
+                cur.execute("SELECT id, role, status FROM users WHERE email = %s;", (admin_email,))
+                existing = cur.fetchone()
+                if existing:
+                    if existing['role'] != 'admin' or existing['status'] != 'active':
+                        cur.execute("""
+                            UPDATE users SET role = 'admin', status = 'active', updated_at = CURRENT_TIMESTAMP
+                            WHERE id = %s;
+                        """, (existing['id'],))
+                        logger.info(f"Existing account '{admin_email}' promoted to active administrator via environment.")
+                else:
+                    admin_id = f"usr-adm-{uuid.uuid4().hex[:10]}"
+                    pwd_hash = generate_password_hash(admin_password)
+                    cur.execute("""
+                        INSERT INTO users (id, name, email, password_hash, role, status)
+                        VALUES (%s, %s, %s, %s, 'admin', 'active');
+                    """, (admin_id, admin_name, admin_email, pwd_hash))
+                    logger.info(f"Bootstrapped administrator account '{admin_email}' from environment.")
+                return
+
+            # If no env admin specified, check if any active administrator exists at all
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND status = 'active';")
+            res = cur.fetchone()
+            if not res or res['count'] == 0:
+                default_admin_email = "admin@commitflow.dev"
+                default_admin_pwd = "Admin@CommitFlow2026!"
+                default_admin_name = "CommitFlow Admin"
+                cur.execute("SELECT id FROM users WHERE email = %s;", (default_admin_email,))
+                if not cur.fetchone():
+                    admin_id = f"usr-adm-{uuid.uuid4().hex[:10]}"
+                    pwd_hash = generate_password_hash(default_admin_pwd)
+                    cur.execute("""
+                        INSERT INTO users (id, name, email, password_hash, role, status)
+                        VALUES (%s, %s, %s, %s, 'admin', 'active');
+                    """, (admin_id, default_admin_name, default_admin_email, pwd_hash))
+                    logger.info(f"Provisioned initial system admin '{default_admin_email}'.")
+    except Exception as e:
+        logger.warning(f"Admin bootstrap notice: {e}")
+
+def create_user(name, email, password, role="user"):
+    """
+    Register a new user account.
+    Public registration strictly assigns role='user'.
+    """
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    
+    name = (name or "").strip()
+    email = (email or "").strip().lower()
+    if not name:
+        raise ValueError("Full name is required.")
+    if not email or "@" not in email:
+        raise ValueError("A valid email address is required.")
+    if not password or len(password) < 6:
+        raise ValueError("Password must be at least 6 characters.")
+    
+    # Strictly validate role
+    if role not in ("user", "admin"):
+        role = "user"
+
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
+        if cur.fetchone():
+            raise ValueError("An account with this email already exists.")
+
+        user_id = f"usr-{uuid.uuid4().hex[:12]}"
+        password_hash = generate_password_hash(password)
+
+        cur.execute("""
+            INSERT INTO users (id, name, email, password_hash, role, status)
+            VALUES (%s, %s, %s, %s, %s, 'active')
+            RETURNING id, name, email, role, status, created_at;
+        """, (user_id, name, email, password_hash, role))
+        user = dict(cur.fetchone())
+
+        # Audit log
+        cur.execute("""
+            INSERT INTO audit_logs (user_id, user_email, action, details)
+            VALUES (%s, %s, 'USER_REGISTERED', %s);
+        """, (user['id'], user['email'], json.dumps({"role": role, "name": name})))
+
+        return user
+
+def authenticate_user(email, password, ip_address=None):
+    """
+    Authenticate user with email and password.
+    Returns (success, message, user_dict_or_None).
+    """
+    if not get_connection_url():
+        return False, "Database connection unavailable.", None
+    
+    email = (email or "").strip().lower()
+    if not email or not password:
+        return False, "Email and password are required.", None
+
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            SELECT id, name, email, password_hash, role, status,
+                   to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   to_char(last_login_at, 'YYYY-MM-DD HH24:MI:SS') as "lastLoginAt"
+            FROM users
+            WHERE email = %s;
+        """, (email,))
+        user_row = cur.fetchone()
+
+        if not user_row:
+            cur.execute("""
+                INSERT INTO audit_logs (user_email, action, details, ip_address)
+                VALUES (%s, 'LOGIN_FAILED', '{"reason": "User not found"}', %s);
+            """, (email, ip_address))
+            return False, "Invalid email or password.", None
+
+        if not check_password_hash(user_row['password_hash'], password):
+            cur.execute("""
+                INSERT INTO audit_logs (user_id, user_email, action, details, ip_address)
+                VALUES (%s, %s, 'LOGIN_FAILED', '{"reason": "Invalid credentials"}', %s);
+            """, (user_row['id'], email, ip_address))
+            return False, "Invalid email or password.", None
+
+        if user_row['status'] == 'deactivated':
+            cur.execute("""
+                INSERT INTO audit_logs (user_id, user_email, action, details, ip_address)
+                VALUES (%s, %s, 'LOGIN_BLOCKED', '{"reason": "Account deactivated"}', %s);
+            """, (user_row['id'], email, ip_address))
+            return False, "This account has been deactivated. Please contact an administrator.", None
+
+        # Update last login
+        cur.execute("""
+            UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = %s;
+        """, (user_row['id'],))
+
+        cur.execute("""
+            INSERT INTO audit_logs (user_id, user_email, action, details, ip_address)
+            VALUES (%s, %s, 'LOGIN_SUCCESS', %s, %s);
+        """, (user_row['id'], email, json.dumps({"role": user_row['role']}), ip_address))
+
+        clean_user = {
+            "id": user_row['id'],
+            "name": user_row['name'],
+            "email": user_row['email'],
+            "role": user_row['role'],
+            "status": user_row['status'],
+            "createdAt": user_row['createdAt'],
+            "lastLoginAt": user_row['lastLoginAt']
+        }
+        return True, "Login successful.", clean_user
+
+def get_user_by_id(user_id):
+    """Retrieve user details without password hash."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT id, name, email, role, status,
+                   to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   to_char(last_login_at, 'YYYY-MM-DD HH24:MI:SS') as "lastLoginAt"
+            FROM users
+            WHERE id = %s;
+        """, (user_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def list_users(search=None, role=None, status=None, limit=100, offset=0):
+    """List registered users with optional filters and meeting counts."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        query = """
+            SELECT u.id, u.name, u.email, u.role, u.status,
+                   to_char(u.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   to_char(u.last_login_at, 'YYYY-MM-DD HH24:MI:SS') as "lastLoginAt",
+                   (SELECT COUNT(*) FROM transcripts t WHERE t.user_id = u.id) as "meetingsCount"
+            FROM users u
+            WHERE 1=1
+        """
+        params = []
+        if search:
+            query += " AND (u.name ILIKE %s OR u.email ILIKE %s)"
+            params.extend([f"%{search}%", f"%{search}%"])
+        if role and role in ('user', 'admin'):
+            query += " AND u.role = %s"
+            params.append(role)
+        if status and status in ('active', 'deactivated'):
+            query += " AND u.status = %s"
+            params.append(status)
+        
+        query += " ORDER BY u.created_at DESC LIMIT %s OFFSET %s;"
+        params.extend([limit, offset])
+
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+def count_active_admins():
+    """Count currently active administrators."""
+    if not get_connection_url():
+        return 0
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND status = 'active';")
+        res = cur.fetchone()
+        return res['count'] if res else 0
+
+def update_user_status(user_id, new_status, actor_admin=None):
+    """
+    Activate or deactivate a user account.
+    Safeguard: prevents deactivating the last active administrator.
+    """
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    if new_status not in ('active', 'deactivated'):
+        raise ValueError("Invalid status. Must be 'active' or 'deactivated'.")
+
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id, name, email, role, status FROM users WHERE id = %s;", (user_id,))
+        target = cur.fetchone()
+        if not target:
+            raise ValueError(f"User '{user_id}' not found.")
+
+        # Last active administrator protection
+        if target['role'] == 'admin' and new_status == 'deactivated':
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND status = 'active';")
+            count = cur.fetchone()['count']
+            if count <= 1:
+                raise ValueError("Cannot deactivate the last active administrator. System requires at least one active admin.")
+
+        cur.execute("""
+            UPDATE users SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s;
+        """, (new_status, user_id))
+
+        # Invalidate sessions if deactivated
+        if new_status == 'deactivated':
+            cur.execute("DELETE FROM sessions WHERE user_id = %s;", (user_id,))
+
+        actor_id = actor_admin['id'] if actor_admin else None
+        actor_email = actor_admin['email'] if actor_admin else 'system'
+        cur.execute("""
+            INSERT INTO audit_logs (user_id, user_email, action, details)
+            VALUES (%s, %s, 'USER_STATUS_CHANGE', %s);
+        """, (actor_id, actor_email, json.dumps({
+            "targetUserId": user_id,
+            "targetEmail": target['email'],
+            "oldStatus": target['status'],
+            "newStatus": new_status
+        })))
+
+        return True
+
+def update_user_role(user_id, new_role, actor_admin=None):
+    """
+    Change user role (user <-> admin).
+    Safeguard: prevents demoting the last active administrator.
+    """
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    if new_role not in ('user', 'admin'):
+        raise ValueError("Invalid role. Must be 'user' or 'admin'.")
+
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id, name, email, role, status FROM users WHERE id = %s;", (user_id,))
+        target = cur.fetchone()
+        if not target:
+            raise ValueError(f"User '{user_id}' not found.")
+
+        # Last active administrator protection
+        if target['role'] == 'admin' and target['status'] == 'active' and new_role != 'admin':
+            cur.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND status = 'active';")
+            count = cur.fetchone()['count']
+            if count <= 1:
+                raise ValueError("Cannot demote the last active administrator. System requires at least one active admin.")
+
+        cur.execute("""
+            UPDATE users SET role = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s;
+        """, (new_role, user_id))
+
+        actor_id = actor_admin['id'] if actor_admin else None
+        actor_email = actor_admin['email'] if actor_admin else 'system'
+        cur.execute("""
+            INSERT INTO audit_logs (user_id, user_email, action, details)
+            VALUES (%s, %s, 'USER_ROLE_CHANGE', %s);
+        """, (actor_id, actor_email, json.dumps({
+            "targetUserId": user_id,
+            "targetEmail": target['email'],
+            "oldRole": target['role'],
+            "newRole": new_role
+        })))
+
+        return True
+
+# -------------------------------------------------------------
+# Session Management
+# -------------------------------------------------------------
+
+def create_session(user_id, duration_days=7):
+    """Generate and store a secure session token."""
+    if not get_connection_url():
+        return None, None
+    token = secrets.token_urlsafe(48)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=duration_days)
+
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO sessions (id, user_id, expires_at)
+            VALUES (%s, %s, %s);
+        """, (token, user_id, expires_at))
+    return token, expires_at
+
+def get_session_user(token):
+    """Validate session token and return user data if active and valid."""
+    if not get_connection_url() or not token:
+        return None
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            SELECT s.id as "sessionId", s.expires_at as "expiresAt",
+                   u.id, u.name, u.email, u.role, u.status,
+                   to_char(u.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   to_char(u.last_login_at, 'YYYY-MM-DD HH24:MI:SS') as "lastLoginAt"
+            FROM sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.id = %s;
+        """, (token,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        
+        # Check expiration
+        now = datetime.now(timezone.utc)
+        if row['expiresAt'] < now:
+            cur.execute("DELETE FROM sessions WHERE id = %s;", (token,))
+            return None
+        
+        # Check if user is deactivated
+        if row['status'] != 'active':
+            cur.execute("DELETE FROM sessions WHERE id = %s;", (token,))
+            return None
+
+        return {
+            "id": row['id'],
+            "name": row['name'],
+            "email": row['email'],
+            "role": row['role'],
+            "status": row['status'],
+            "createdAt": row['createdAt'],
+            "lastLoginAt": row['lastLoginAt']
+        }
+
+def delete_session(token):
+    """Invalidate a specific session."""
+    if not get_connection_url() or not token:
+        return False
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM sessions WHERE id = %s;", (token,))
+        return cur.rowcount > 0
+
+def delete_user_sessions(user_id):
+    """Invalidate all sessions for a user (e.g. on deactivation)."""
+    if not get_connection_url() or not user_id:
+        return False
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM sessions WHERE user_id = %s;", (user_id,))
+        return True
+
+# -------------------------------------------------------------
+# Audit Logs
+# -------------------------------------------------------------
+
+def log_audit_event(user_id, user_email, action, details=None, ip_address=None):
+    """Store an unmodifiable audit record."""
+    if not get_connection_url():
+        return False
+    try:
+        with get_db_cursor(commit=True) as cur:
+            cur.execute("""
+                INSERT INTO audit_logs (user_id, user_email, action, details, ip_address)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (user_id, user_email, action, json.dumps(details or {}), ip_address))
+            return True
+    except Exception as e:
+        logger.error(f"Failed to record audit event: {e}")
+        return False
+
+def list_audit_logs(limit=100, offset=0, action_filter=None):
+    """Retrieve recent audit logs."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        query = """
+            SELECT id, user_id as "userId", user_email as "userEmail",
+                   action, details, ip_address as "ipAddress",
+                   to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt"
+            FROM audit_logs
+        """
+        params = []
+        if action_filter:
+            query += " WHERE action = %s"
+            params.append(action_filter)
+        query += " ORDER BY created_at DESC LIMIT %s OFFSET %s;"
+        params.extend([limit, offset])
+
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+# -------------------------------------------------------------
+# Admin Stats & Platform Overview
+# -------------------------------------------------------------
+
+def get_admin_stats():
+    """Calculate platform-wide analytics directly from Neon PostgreSQL."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=False) as cur:
+        stats = {}
+
+        # Users
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_users,
+                COUNT(*) FILTER (WHERE status = 'active') as active_users,
+                COUNT(*) FILTER (WHERE status = 'deactivated') as deactivated_users,
+                COUNT(*) FILTER (WHERE role = 'admin') as admin_users,
+                COUNT(*) FILTER (WHERE role = 'user') as standard_users
+            FROM users;
+        """)
+        u_row = cur.fetchone() or {}
+        stats.update(u_row)
+
+        # Transcripts / Meetings
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_meetings,
+                COUNT(*) FILTER (WHERE status = 'Processed') as processed_meetings,
+                COUNT(*) FILTER (WHERE status = 'Processing') as processing_meetings,
+                COUNT(*) FILTER (WHERE status = 'Failed') as failed_meetings
+            FROM transcripts;
+        """)
+        t_row = cur.fetchone() or {}
+        stats.update(t_row)
+
+        # Action Items
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_action_items,
+                COUNT(*) FILTER (WHERE status = 'Approved') as approved_action_items,
+                COUNT(*) FILTER (WHERE status = 'Pending Approval') as pending_action_items,
+                COUNT(*) FILTER (WHERE status = 'Rejected') as rejected_action_items
+            FROM action_items;
+        """)
+        a_row = cur.fetchone() or {}
+        stats.update(a_row)
+
+        # Decisions
+        cur.execute("SELECT COUNT(*) as total_decisions FROM decisions;")
+        d_row = cur.fetchone() or {}
+        stats.update(d_row)
+
+        # Recent Platform Activity
+        cur.execute("""
+            SELECT id, user_email as "userEmail", action, details,
+                   to_char(created_at, 'Mon DD, YYYY HH12:MI AM') as "createdAt"
+            FROM audit_logs
+            ORDER BY created_at DESC
+            LIMIT 8;
+        """)
+        stats['recent_activity'] = [dict(r) for r in cur.fetchall()]
+
+        return stats
+
+def get_admin_meetings_overview(limit=50, offset=0):
+    """Retrieve meeting metadata for administrator oversight."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT t.id, t.title, t.filename, t.file_size as "fileSize",
+                   t.source_type as "sourceType", t.status, t.duration,
+                   to_char(t.uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
+                   t.user_id as "userId",
+                   COALESCE(u.name, 'System Seed') as "creatorName",
+                   COALESCE(u.email, 'system@commitflow.internal') as "creatorEmail",
+                   (SELECT COUNT(*) FROM action_items a WHERE a.transcript_id = t.id) as "actionItemsCount",
+                   (SELECT COUNT(*) FROM decisions d WHERE d.transcript_id = t.id) as "decisionsCount"
+            FROM transcripts t
+            LEFT JOIN users u ON t.user_id = u.id
+            ORDER BY t.created_at DESC
+            LIMIT %s OFFSET %s;
+        """, (limit, offset))
+        return [dict(r) for r in cur.fetchall()]
+
+# -------------------------------------------------------------
+# Platform Settings
+# -------------------------------------------------------------
+
+def get_platform_settings():
+    """Retrieve platform configuration settings."""
+    defaults = {
+        "allow_public_registration": True,
+        "default_session_days": 7,
+        "require_task_approval": True,
+        "max_transcript_size_mb": 15,
+        "platform_name": "CommitFlow Enterprise",
+        "maintenance_mode": False
+    }
+    if not get_connection_url():
+        return defaults
+    try:
+        with get_db_cursor(commit=False) as cur:
+            cur.execute("SELECT key, value FROM platform_settings;")
+            rows = cur.fetchall()
+            for r in rows:
+                defaults[r['key']] = r['value']
+        return defaults
+    except Exception as e:
+        logger.warning(f"Failed to load platform settings: {e}")
+        return defaults
+
+def update_platform_settings(new_settings, actor_admin=None):
+    """Update platform configuration."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    with get_db_cursor(commit=True) as cur:
+        for key, val in new_settings.items():
+            cur.execute("""
+                INSERT INTO platform_settings (key, value, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;
+            """, (key, json.dumps(val) if not isinstance(val, (int, float, str, bool, dict, list)) else json.dumps(val)))
+
+        actor_id = actor_admin['id'] if actor_admin else None
+        actor_email = actor_admin['email'] if actor_admin else 'system'
+        cur.execute("""
+            INSERT INTO audit_logs (user_id, user_email, action, details)
+            VALUES (%s, %s, 'PLATFORM_SETTINGS_UPDATED', %s);
+        """, (actor_id, actor_email, json.dumps({"updatedKeys": list(new_settings.keys())})))
+
+        return True
