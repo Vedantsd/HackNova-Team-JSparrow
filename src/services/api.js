@@ -218,5 +218,47 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(settings)
     })
-  }
+  },
+
+  // -------------------------------------------------------------
+  // Admin Teams APIs
+  // -------------------------------------------------------------
+  getAdminTeams: () => req('/api/admin/teams'),
+  createAdminTeam: (data) => req('/api/admin/teams', { method: 'POST', body: JSON.stringify(data) }),
+  updateAdminTeam: (teamId, data) => req(`/api/admin/teams/${teamId}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteAdminTeam: (teamId) => req(`/api/admin/teams/${teamId}`, { method: 'DELETE' }),
+  getAdminTeamMembers: (teamId) => req(`/api/admin/teams/${teamId}/members`),
+  addAdminTeamMember: (teamId, data) => req(`/api/admin/teams/${teamId}/members`, { method: 'POST', body: JSON.stringify(data) }),
+  removeAdminTeamMember: (teamId, userId) => req(`/api/admin/teams/${teamId}/members/${userId}`, { method: 'DELETE' }),
+  getAdminEligibleLeads: () => req('/api/admin/eligible-leads'),
+
+  // -------------------------------------------------------------
+  // Team Lead APIs
+  // -------------------------------------------------------------
+  getTeamLeadDashboard: () => req('/api/team-lead/dashboard'),
+  getTeamLeadTeam: () => req('/api/team-lead/team'),
+  addTeamLeadMember: (data) => req('/api/team-lead/team/members', { method: 'POST', body: JSON.stringify(data) }),
+  removeTeamLeadMember: (userId) => req(`/api/team-lead/team/members/${userId}`, { method: 'DELETE' }),
+  getTeamLeadAvailableUsers: () => req('/api/team-lead/available-users'),
+  getTeamLeadMeetings: (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return req('/api/team-lead/meetings' + (qs ? `?${qs}` : ''))
+  },
+  createTeamLeadMeeting: (data) => req('/api/team-lead/meetings', { method: 'POST', body: JSON.stringify(data) }),
+  getTeamLeadCalendar: (year, month) => req(`/api/team-lead/calendar?year=${year}&month=${month}`),
+  getTeamLeadTranscripts: () => req('/api/team-lead/transcripts'),
+  getTeamLeadAnalysis: (transcriptId) => req(`/api/team-lead/transcripts/${transcriptId}/analysis`),
+  getTeamLeadActionItems: () => req('/api/team-lead/action-items'),
+  assignTeamLeadActionItem: (actionId, assigneeId) => req(`/api/team-lead/action-items/${actionId}/assign`, {
+    method: 'PUT',
+    body: JSON.stringify({ assigneeId })
+  }),
+  updateTeamLeadActionItem: (actionId, data) => req(`/api/team-lead/action-items/${actionId}`, {
+    method: 'PUT',
+    body: JSON.stringify(data)
+  }),
+  getTeamLeadReports: () => req('/api/team-lead/reports')
 }

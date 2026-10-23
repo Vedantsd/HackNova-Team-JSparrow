@@ -60,6 +60,7 @@ export function AuthProvider({ children }) {
     loading,
     isAuthenticated: !!user,
     isAdmin: user?.role === 'admin',
+    isTeamLead: user?.role === 'team_lead',
     login,
     register,
     logout,
