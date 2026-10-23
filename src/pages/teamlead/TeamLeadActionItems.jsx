@@ -10,7 +10,9 @@ import {
   X,
   User,
   Calendar,
-  AlertTriangle
+  AlertTriangle,
+  Download,
+  Layers
 } from 'lucide-react'
 import { api } from '../../services/api.js'
 
@@ -111,10 +113,45 @@ export default function TeamLeadActionItems() {
           </p>
         </div>
 
-        <button className="btn" onClick={loadData} disabled={loading}>
-          <RefreshCw size={14} className={loading ? 'spin' : ''} />
-          <span>Refresh</span>
-        </button>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button
+            className="btn sm"
+            onClick={() => { window.location.href = api.getExportTasksUrl('csv') }}
+            title="Download CSV export"
+            style={{ gap: '5px' }}
+          >
+            <Download size={13} />
+            <span>Export CSV</span>
+          </button>
+          <button
+            className="btn sm"
+            onClick={async () => {
+              try {
+                const data = await api.exportTasksJson()
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = `team_approved_tasks.json`
+                document.body.appendChild(a)
+                a.click()
+                document.body.removeChild(a)
+                URL.revokeObjectURL(url)
+              } catch (e) {
+                alert('Export failed')
+              }
+            }}
+            title="Download JSON export"
+            style={{ gap: '5px' }}
+          >
+            <Layers size={13} />
+            <span>Export JSON</span>
+          </button>
+          <button className="btn" onClick={loadData} disabled={loading}>
+            <RefreshCw size={14} className={loading ? 'spin' : ''} />
+            <span>Refresh</span>
+          </button>
+        </div>
       </div>
 
       {/* Notifications */}
@@ -268,9 +305,31 @@ export default function TeamLeadActionItems() {
                   >
                     {/* Title */}
                     <td style={{ padding: '14px 18px' }}>
-                      <div style={{ fontWeight: 600, color: 'var(--color-text)' }}>
-                        {item.title}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <span style={{ fontWeight: 600, color: 'var(--color-text)' }}>
+                          {item.title}
+                        </span>
+                        <span className={`classification-badge ${item.itemType || 'commitment'}`}>
+                          {item.itemType ? item.itemType.replace(/_/g, ' ') : 'Commitment'}
+                        </span>
                       </div>
+                      {item.description && (
+                        <div className="muted" style={{ fontSize: '12px', marginTop: '3px', lineHeight: 1.4 }}>
+                          {item.description}
+                        </div>
+                      )}
+                      {(item.isDuplicate || item.duplicateWarning) && (
+                        <div className="duplicate-callout" style={{ marginTop: '4px', padding: '4px 8px', fontSize: '11px' }}>
+                          <AlertTriangle size={12} style={{ flexShrink: 0 }} />
+                          <span>{item.duplicateWarning || 'Duplicate detected'}</span>
+                        </div>
+                      )}
+                      {(item.isConflict || item.conflictWarning) && (
+                        <div className="conflict-callout" style={{ marginTop: '4px', padding: '4px 8px', fontSize: '11px' }}>
+                          <AlertCircle size={12} style={{ flexShrink: 0 }} />
+                          <span>{item.conflictWarning || 'Conflict detected'}</span>
+                        </div>
+                      )}
                     </td>
 
                     {/* Meeting */}
