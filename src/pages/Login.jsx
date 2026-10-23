@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useNavigate, useLocation } from 'react-router-dom'
-import { Mail, Lock, Eye, EyeOff, LogIn, AlertCircle, Sparkles, Sun, Moon, ShieldCheck } from 'lucide-react'
+import { Mail, Lock, Eye, EyeOff, LogIn, AlertCircle, Sparkles, Sun, Moon, ShieldCheck, Users } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useTheme } from '../theme.jsx'
 import Logo from '../components/Logo.jsx'
@@ -36,11 +36,13 @@ export default function Login() {
     setLoading(true)
     try {
       const user = await login(trimmedEmail, password)
-      // Redirect based on role
-      if (user.role === 'admin' && from === '/') {
-        navigate('/admin', { replace: true })
+      // Redirect strictly based on role to correct isolated dashboard
+      if (user.role === 'admin') {
+        navigate(from.startsWith('/admin') ? from : '/admin/dashboard', { replace: true })
+      } else if (user.role === 'team_lead') {
+        navigate(from.startsWith('/team-lead') ? from : '/team-lead/dashboard', { replace: true })
       } else {
-        navigate(from, { replace: true })
+        navigate(from.startsWith('/user') ? from : '/user/dashboard', { replace: true })
       }
     } catch (err) {
       setError(err.message || 'Invalid email or password.')
@@ -259,6 +261,15 @@ export default function Login() {
             >
               <ShieldCheck size={13} style={{ color: '#4ade80' }} />
               Admin: admin@commitflow.dev
+            </button>
+            <button
+              type="button"
+              className="btn"
+              style={{ height: '30px', fontSize: '11.5px', padding: '0 10px' }}
+              onClick={() => fillQuickCredentials('teamlead@commitflow.dev', 'Lead@CommitFlow2026!')}
+            >
+              <Users size={13} style={{ color: '#6366f1' }} />
+              Team Lead: teamlead@commitflow.dev
             </button>
             <button
               type="button"
