@@ -309,13 +309,13 @@ export default function Transcripts() {
           ) : filteredTranscripts.length === 0 ? (
             <div className="mcard col" style={{ textAlign: 'center', padding: '40px 16px' }}>
               <FileCode size={36} color="var(--color-muted)" style={{ margin: '0 auto 8px' }} />
-              <b>No transcripts found</b>
-              <p className="muted sm">
+              <b>No transcript available</b>
+              <p className="muted sm" style={{ maxWidth: '440px', margin: '4px auto 14px' }}>
                 {query || statusFilter !== 'all' 
                   ? 'No records match your active search or status filter.' 
-                  : 'You have not uploaded any meeting transcripts yet.'}
+                  : 'No transcript available. Upload a meeting transcript or enter meeting notes to get started.'}
               </p>
-              <div style={{ marginTop: '12px' }}>
+              <div>
                 <button className="btn primary sm" onClick={() => setShowUploadModal(true)}>
                   <FileUp size={14} /> Upload First Transcript
                 </button>

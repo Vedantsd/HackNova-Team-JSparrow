@@ -10,27 +10,43 @@ import {
   CheckCircle2, 
   Scale
 } from 'lucide-react'
+import { api } from '../services/api.js'
 import { transcriptStore } from '../services/transcriptStore.js'
-import { meetings as demoMeetings, insights as demoInsights } from '../data/demo.js'
 
 export default function Summaries() {
   const nav = useNavigate()
   const { query = '' } = useOutletContext() || {}
   const [transcripts, setTranscripts] = useState([])
-  const [sourceFilter, setSourceFilter] = useState('all') // 'all' | 'uploaded' | 'room'
+  const [loading, setLoading] = useState(true)
+  const [sourceFilter, setSourceFilter] = useState('all')
+
+  const loadData = async () => {
+    setLoading(true)
+    try {
+      const list = await api.listTranscripts()
+      if (Array.isArray(list)) {
+        setTranscripts(list)
+      } else {
+        setTranscripts(transcriptStore.getTranscripts())
+      }
+    } catch {
+      setTranscripts(transcriptStore.getTranscripts())
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    setTranscripts(transcriptStore.getTranscripts())
-    const handleUpdate = () => setTranscripts(transcriptStore.getTranscripts())
+    loadData()
+    const handleUpdate = () => loadData()
     window.addEventListener('cf-transcripts-updated', handleUpdate)
     return () => window.removeEventListener('cf-transcripts-updated', handleUpdate)
   }, [])
 
-  // Build unified summary items from both Uploaded Transcripts and CommitFlow Meetings
+  // Build unified summary items exclusively from real processed transcripts
   const allSummaries = useMemo(() => {
     const list = []
 
-    // 1. Processed Uploaded Transcripts
     transcripts.forEach(t => {
       if (t.status === 'Processed' && t.summary) {
         list.push({
@@ -38,38 +54,16 @@ export default function Summaries() {
           title: t.title,
           sourceType: 'Uploaded Transcript',
           sourceBadge: t.fileType || 'TXT',
-          date: t.uploadedAt,
-          overview: t.summary.overview,
-          keyPoints: t.summary.keyDiscussionPoints || [],
-          outcomes: t.summary.outcomes,
+          date: t.uploadedAt || t.createdAt,
+          overview: typeof t.summary === 'string' ? t.summary : (t.summary.overview || ''),
+          keyPoints: Array.isArray(t.summary?.keyDiscussionPoints) ? t.summary.keyDiscussionPoints : [],
+          outcomes: typeof t.summary?.outcomes === 'string' ? t.summary.outcomes : '',
           decisionsCount: t.decisions?.length || 0,
           actionsCount: t.actionItems?.length || 0,
           participantsCount: t.participants?.length || 0,
-          linkTo: `/transcripts/${t.id}/analysis`
+          linkTo: `/user/transcripts/${t.id}/analysis`
         })
       }
-    })
-
-    // 2. CommitFlow Room Meetings
-    demoMeetings.forEach((m, idx) => {
-      const insight = demoInsights[idx % demoInsights.length]
-      list.push({
-        id: `room-${m.id}`,
-        title: m.title,
-        sourceType: 'CommitFlow Meeting Room',
-        sourceBadge: 'Live Room',
-        date: m.when,
-        overview: `${m.title} held within CommitFlow. Discussion focused on sprint delivery, client synchronization, and team roadmap execution.`,
-        keyPoints: [
-          insight?.body || 'Confirmed key milestones for engineering deliverables.',
-          'Review of cross-functional team blockers and status updates.'
-        ],
-        outcomes: 'Recorded in meeting archive with real-time audio transcripts.',
-        decisionsCount: 1,
-        actionsCount: 2,
-        participantsCount: m.people,
-        linkTo: `/meetings/${m.id}/live`
-      })
     })
 
     return list
@@ -132,12 +126,26 @@ export default function Summaries() {
 
       {/* Summaries Grid / List */}
       <div className="stack" style={{ gap: '16px' }}>
-        {filteredSummaries.length === 0 ? (
+        {loading ? (
+          <section className="panel">
+            <div className="pbody" style={{ textAlign: 'center', padding: '40px 16px' }}>
+              <Sparkles size={32} className="spin-icon" color="var(--color-primary)" style={{ margin: '0 auto 8px' }} />
+              <p className="muted">Loading summaries...</p>
+            </div>
+          </section>
+        ) : filteredSummaries.length === 0 ? (
           <section className="panel">
             <div className="pbody" style={{ textAlign: 'center', padding: '40px 16px' }}>
               <Sparkles size={32} color="var(--color-muted)" style={{ margin: '0 auto 8px' }} />
-              <b>No summaries match your filter</b>
-              <p className="muted sm">Try adjusting your query or upload a transcript to generate an AI summary.</p>
+              <b>No transcript available</b>
+              <p className="muted sm" style={{ maxWidth: '440px', margin: '6px auto 14px' }}>
+                No transcript available. Upload a meeting transcript or enter meeting notes to get started.
+              </p>
+              <div>
+                <button className="btn primary sm" onClick={() => nav('/user/transcripts?upload=true')}>
+                  <FileText size={14} /> Upload Meeting Transcript
+                </button>
+              </div>
             </div>
           </section>
         ) : (

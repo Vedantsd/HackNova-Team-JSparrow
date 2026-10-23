@@ -1,26 +1,30 @@
 import { useState, useEffect } from 'react'
-import { useOutletContext } from 'react-router-dom'
+import { useOutletContext, useNavigate } from 'react-router-dom'
+import { Video, Plus, Loader2 } from 'lucide-react'
 import MeetingCard from '../components/MeetingCard.jsx'
-import { meetings as demoMeetings } from '../data/demo.js'
 import { api } from '../services/api.js'
 
 export default function Meetings() {
-  const { query } = useOutletContext()
+  const { query = '' } = useOutletContext() || {}
+  const nav = useNavigate()
   const [f, setF] = useState('all')
-  const [meetingsList, setMeetingsList] = useState(demoMeetings)
+  const [meetingsList, setMeetingsList] = useState([])
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     let mounted = true
     const loadMeetings = async () => {
+      setLoading(true)
       try {
         const live = await api.listMeetings()
-        if (mounted && Array.isArray(live) && live.length > 0) {
-          const liveIds = new Set(live.map(m => m.id))
-          const merged = [...live, ...demoMeetings.filter(d => !liveIds.has(d.id))]
-          setMeetingsList(merged)
+        if (mounted && Array.isArray(live)) {
+          setMeetingsList(live)
         }
       } catch (err) {
-        // Fallback to demo
+        console.error('Failed to load meetings:', err)
+        if (mounted) setMeetingsList([])
+      } finally {
+        if (mounted) setLoading(false)
       }
     }
     loadMeetings()
@@ -33,17 +37,43 @@ export default function Meetings() {
     <section className="panel">
       <div className="phead">
         <h2>My Meetings</h2>
-        <div className="row">
+        <div className="row" style={{ gap: '8px', flexWrap: 'wrap' }}>
           {['all', 'live', 'done'].map(x => (
             <button key={x} className={'chip' + (f === x ? ' on' : '')} onClick={() => setF(x)}>
               {x === 'done' ? 'completed' : x}
             </button>
           ))}
+          <button className="btn primary sm" onClick={() => nav('/meetings/new/live')}>
+            <Plus size={14} /> New Instant Call
+          </button>
         </div>
       </div>
       <div className="pbody">
-        {list.length ? list.map(m => <MeetingCard key={m.id} m={m} />) : <p className="muted">No meetings found.</p>}
+        {loading ? (
+          <div style={{ textAlign: 'center', padding: '36px 16px' }}>
+            <Loader2 size={24} className="spin-icon" style={{ margin: '0 auto 8px' }} />
+            <p className="muted">Loading meetings...</p>
+          </div>
+        ) : list.length ? (
+          list.map(m => <MeetingCard key={m.id} m={m} />)
+        ) : (
+          <div className="mcard col" style={{ textAlign: 'center', padding: '36px 16px' }}>
+            <Video size={36} color="var(--color-muted)" style={{ margin: '0 auto 8px' }} />
+            <b>No meetings found</b>
+            <p className="muted sm" style={{ maxWidth: '400px', margin: '4px auto 12px' }}>
+              {query || f !== 'all'
+                ? 'No meetings match your active search or filter.'
+                : 'You do not have any meetings scheduled or recorded yet.'}
+            </p>
+            <div>
+              <button className="btn primary sm" onClick={() => nav('/meetings/new/live')}>
+                <Plus size={14} /> Start Instant Meeting
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </section>
   )
 }
+

@@ -38,13 +38,27 @@ export default function MeetingAnalysis() {
   
   // Editing action item modal or inline state
   const [editingActionId, setEditingActionId] = useState(null)
-  const [editForm, setEditForm] = useState({ title: '', owner: '', deadline: '', priority: 'Medium' })
+  const [activeUsers, setActiveUsers] = useState([])
+  const [bulkApproving, setBulkApproving] = useState(false)
+  const [editForm, setEditForm] = useState({ 
+    title: '', 
+    description: '',
+    owner: '', 
+    assigneeId: '',
+    deadline: '', 
+    priority: 'Medium',
+    itemType: 'commitment'
+  })
 
   const loadData = async () => {
     try {
-      const data = await api.getTranscript(id)
+      const [data, usersList] = await Promise.all([
+        api.getTranscript(id).catch(() => transcriptStore.getTranscript(id)),
+        api.getActiveUsers().catch(() => [])
+      ])
       if (data) setTranscript(data)
       else setTranscript(transcriptStore.getTranscript(id))
+      if (Array.isArray(usersList)) setActiveUsers(usersList)
     } catch {
       setTranscript(transcriptStore.getTranscript(id))
     } finally {
@@ -105,9 +119,12 @@ export default function MeetingAnalysis() {
     setEditingActionId(action.id)
     setEditForm({
       title: action.title,
+      description: action.description || '',
       owner: action.owner,
+      assigneeId: action.assigneeId || '',
       deadline: action.deadline,
-      priority: action.priority || 'Medium'
+      priority: action.priority || 'Medium',
+      itemType: action.itemType || 'commitment'
     })
   }
 
@@ -115,6 +132,48 @@ export default function MeetingAnalysis() {
     await api.editActionItem(transcript.id, actionId, editForm)
     setEditingActionId(null)
     await loadData()
+  }
+
+  const handleBulkApproveEligible = async () => {
+    if (!transcript?.actionItems) return
+    const eligibleIds = transcript.actionItems
+      .filter(i => i.status === 'Pending Approval' && (!i.itemType || i.itemType === 'commitment'))
+      .map(i => i.id)
+    if (eligibleIds.length === 0) return
+    try {
+      setBulkApproving(true)
+      await api.bulkApproveActionItems(eligibleIds)
+      await loadData()
+    } catch (err) {
+      console.error('Failed to bulk approve:', err)
+      alert(err.message || 'Failed to bulk approve tasks.')
+    } finally {
+      setBulkApproving(false)
+    }
+  }
+
+  const handleExportCSV = () => {
+    if (!transcript) return
+    window.location.href = api.getExportTasksUrl('csv', transcript.id)
+  }
+
+  const handleExportJSON = async () => {
+    if (!transcript) return
+    try {
+      const data = await api.exportTasksJson(transcript.id)
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${(transcript.title || 'tasks').replace(/\s+/g, '_')}_approved_tasks.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Failed to export JSON:', err)
+      alert('Failed to export tasks as JSON.')
+    }
   }
 
   const handleCopyTranscript = () => {
@@ -359,16 +418,51 @@ export default function MeetingAnalysis() {
       {activeTab === 'actions' && (
         <section className="panel">
           <div className="phead">
-            <div className="row" style={{ gap: '8px' }}>
-              <CheckSquare size={18} color="var(--color-primary)" />
-              <h3>Action Items & Human Approval</h3>
+            <div className="between" style={{ width: '100%', flexWrap: 'wrap', gap: '10px' }}>
+              <div className="row" style={{ gap: '8px' }}>
+                <CheckSquare size={18} color="var(--color-primary)" />
+                <h3>Action Items & Human Approval</h3>
+                <span className="tag">Human Review Required</span>
+              </div>
+
+              <div className="row" style={{ gap: '8px' }}>
+                {transcript.actionItems && transcript.actionItems.some(i => i.status === 'Pending Approval' && (!i.itemType || i.itemType === 'commitment')) && (
+                  <button
+                    className="btn primary sm"
+                    onClick={handleBulkApproveEligible}
+                    disabled={bulkApproving}
+                    style={{ background: '#10b981', borderColor: '#10b981', gap: '6px' }}
+                    title="Approve all proposed commitments that have no unresolved issues"
+                  >
+                    <span>{bulkApproving ? 'Approving...' : 'Approve All Eligible Commitments'}</span>
+                  </button>
+                )}
+
+                <button
+                  className="btn sm"
+                  onClick={handleExportCSV}
+                  title="Download approved tasks as CSV spreadsheet"
+                  style={{ gap: '5px' }}
+                >
+                  <Download size={13} />
+                  <span>Export CSV</span>
+                </button>
+
+                <button
+                  className="btn sm"
+                  onClick={handleExportJSON}
+                  title="Download structured JSON"
+                  style={{ gap: '5px' }}
+                >
+                  <span>Export JSON</span>
+                </button>
+              </div>
             </div>
-            <span className="tag">Approval Required</span>
           </div>
 
           <div className="pbody">
-            <div className="muted sm" style={{ marginBottom: '6px' }}>
-              AI-extracted tasks require human review before external execution or tool synchronization.
+            <div className="muted sm" style={{ marginBottom: '10px' }}>
+              AI-extracted tasks require human review before external execution or tool synchronization. Verify owners, deadlines, and classifications.
             </div>
 
             {(!transcript.actionItems || transcript.actionItems.length === 0) ? (
@@ -386,15 +480,29 @@ export default function MeetingAnalysis() {
                       {/* Top Row: Title, Priority, Status */}
                       <div className="between" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: '8px' }}>
                         {isEditing ? (
-                          <input 
-                            className="input-field" 
-                            style={{ flex: 1, minWidth: '220px' }}
-                            value={editForm.title}
-                            onChange={e => setEditForm(f => ({ ...f, title: e.target.value }))}
-                          />
+                          <div className="col grow" style={{ gap: '8px', minWidth: '220px' }}>
+                            <input 
+                              className="input-field" 
+                              placeholder="Task Title"
+                              value={editForm.title}
+                              onChange={e => setEditForm(f => ({ ...f, title: e.target.value }))}
+                            />
+                            <input
+                              className="input-field sm"
+                              placeholder="Detailed Description"
+                              value={editForm.description}
+                              onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                            />
+                          </div>
                         ) : (
-                          <div className="row" style={{ gap: '8px' }}>
+                          <div className="row" style={{ gap: '8px', flexWrap: 'wrap' }}>
                             <b style={{ fontSize: '15px' }}>{item.title}</b>
+                            
+                            {/* Classification Badge */}
+                            <span className={`classification-badge ${item.itemType || 'commitment'}`}>
+                              {item.itemType ? item.itemType.replace(/_/g, ' ') : 'Commitment'}
+                            </span>
+
                             {item.priority && (
                               <span className={`tag ${item.priority === 'High' ? 'danger-tag' : ''}`}>
                                 {item.priority} Priority
@@ -410,30 +518,84 @@ export default function MeetingAnalysis() {
                         </div>
                       </div>
 
-                      {/* Description */}
-                      <p className="muted sm" style={{ margin: '4px 0', lineHeight: 1.5 }}>
-                        {item.description}
-                      </p>
+                      {/* Description (Read Mode) */}
+                      {!isEditing && (
+                        <p className="muted sm" style={{ margin: '6px 0', lineHeight: 1.5 }}>
+                          {item.description}
+                        </p>
+                      )}
+
+                      {/* Duplicate Warning Callout */}
+                      {(item.isDuplicate || item.duplicateWarning) && (
+                        <div className="duplicate-callout">
+                          <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: '2px' }} />
+                          <div>
+                            <strong>Duplicate Warning:</strong> {item.duplicateWarning || 'This task closely matches an existing item.'}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Conflict Warning Callout */}
+                      {(item.isConflict || item.conflictWarning) && (
+                        <div className="conflict-callout">
+                          <AlertCircle size={14} style={{ flexShrink: 0, marginTop: '2px' }} />
+                          <div>
+                            <strong>Conflict Warning:</strong> {item.conflictWarning || 'Scheduling or owner conflict detected.'}
+                          </div>
+                        </div>
+                      )}
 
                       {/* Metadata Row: Owner & Deadline with Ambiguity Flags */}
-                      <div className="row" style={{ gap: '16px', margin: '6px 0', flexWrap: 'wrap' }}>
+                      <div className="row" style={{ gap: '16px', margin: '8px 0', flexWrap: 'wrap' }}>
                         {/* Owner */}
                         <div className="row" style={{ gap: '6px' }}>
                           <span className="muted sm">Owner:</span>
                           {isEditing ? (
-                            <input 
-                              className="input-field" 
-                              style={{ width: '140px', padding: '4px 8px', height: '30px' }}
-                              value={editForm.owner}
-                              onChange={e => setEditForm(f => ({ ...f, owner: e.target.value }))}
-                            />
+                            <select
+                              className="input-field"
+                              style={{ height: '30px', padding: '2px 8px', fontSize: '13px', minWidth: '160px' }}
+                              value={editForm.assigneeId || ''}
+                              onChange={e => {
+                                const selectedId = e.target.value
+                                const u = activeUsers.find(usr => usr.id === selectedId)
+                                setEditForm(f => ({
+                                  ...f,
+                                  assigneeId: selectedId || '',
+                                  owner: u ? u.name : (selectedId ? f.owner : 'Unassigned')
+                                }))
+                              }}
+                            >
+                              <option value="">Unassigned (Ambiguous)</option>
+                              {activeUsers.map(u => (
+                                <option key={u.id} value={u.id}>
+                                  {u.name} ({u.role})
+                                </option>
+                              ))}
+                            </select>
                           ) : (
                             <span className={item.ownerStatus === 'ambiguous' ? 'warning-flag' : 'confirmed-meta'}>
                               {item.ownerStatus === 'ambiguous' && <AlertTriangle size={12} />}
-                              {item.owner}
+                              {item.owner || 'Unassigned'}
                             </span>
                           )}
                         </div>
+
+                        {/* Classification selector (in Edit mode) */}
+                        {isEditing && (
+                          <div className="row" style={{ gap: '6px' }}>
+                            <span className="muted sm">Type:</span>
+                            <select
+                              className="input-field"
+                              style={{ height: '30px', padding: '2px 8px', fontSize: '13px' }}
+                              value={editForm.itemType || 'commitment'}
+                              onChange={e => setEditForm(f => ({ ...f, itemType: e.target.value }))}
+                            >
+                              <option value="commitment">Commitment</option>
+                              <option value="suggestion">Suggestion</option>
+                              <option value="unresolved_question">Unresolved Question</option>
+                            </select>
+                          </div>
+                        )}
 
                         {/* Deadline */}
                         <div className="row" style={{ gap: '6px' }}>
@@ -442,7 +604,7 @@ export default function MeetingAnalysis() {
                             <input 
                               type="date"
                               className="input-field" 
-                              style={{ width: '140px', padding: '4px 8px', height: '30px' }}
+                              style={{ width: '135px', padding: '2px 8px', height: '30px' }}
                               value={editForm.deadline !== 'Unspecified' ? editForm.deadline : ''}
                               onChange={e => setEditForm(f => ({ ...f, deadline: e.target.value || 'Unspecified' }))}
                             />
@@ -453,6 +615,23 @@ export default function MeetingAnalysis() {
                             </span>
                           )}
                         </div>
+
+                        {/* Priority selector (in Edit mode) */}
+                        {isEditing && (
+                          <div className="row" style={{ gap: '6px' }}>
+                            <span className="muted sm">Priority:</span>
+                            <select
+                              className="input-field"
+                              style={{ height: '30px', padding: '2px 8px', fontSize: '13px' }}
+                              value={editForm.priority || 'Medium'}
+                              onChange={e => setEditForm(f => ({ ...f, priority: e.target.value }))}
+                            >
+                              <option value="High">High</option>
+                              <option value="Medium">Medium</option>
+                              <option value="Low">Low</option>
+                            </select>
+                          </div>
+                        )}
                       </div>
 
                       {/* Supporting Transcript Evidence */}
@@ -500,9 +679,16 @@ export default function MeetingAnalysis() {
                           )}
 
                           {isApproved && (
-                            <span className="muted sm" style={{ color: '#16a34a', fontWeight: 600 }}>
-                              ✓ Approved for Execution
-                            </span>
+                            <div className="row" style={{ gap: '6px' }}>
+                              <span className="muted sm" style={{ color: '#16a34a', fontWeight: 600 }}>
+                                ✓ Approved for Execution
+                              </span>
+                              {item.approvedByName && (
+                                <span className="audit-note">
+                                  (by {item.approvedByName})
+                                </span>
+                              )}
+                            </div>
                           )}
 
                           {isRejected && (
