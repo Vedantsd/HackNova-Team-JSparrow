@@ -17,11 +17,12 @@ import {
   Download, 
   Edit3, 
   Save, 
-  Loader2, 
-  AlertCircle,
   RefreshCw,
-  Quote
+  Quote,
+  Loader2,
+  AlertCircle
 } from 'lucide-react'
+import { api } from '../services/api.js'
 import { transcriptStore } from '../services/transcriptStore.js'
 
 export default function MeetingAnalysis() {
@@ -38,10 +39,16 @@ export default function MeetingAnalysis() {
   const [editingActionId, setEditingActionId] = useState(null)
   const [editForm, setEditForm] = useState({ title: '', owner: '', deadline: '', priority: 'Medium' })
 
-  const loadData = () => {
-    const data = transcriptStore.getTranscript(id)
-    setTranscript(data)
-    setLoading(false)
+  const loadData = async () => {
+    try {
+      const data = await api.getTranscript(id)
+      if (data) setTranscript(data)
+      else setTranscript(transcriptStore.getTranscript(id))
+    } catch {
+      setTranscript(transcriptStore.getTranscript(id))
+    } finally {
+      setLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -81,16 +88,16 @@ export default function MeetingAnalysis() {
   }, [transcript, transcriptSearch])
 
   // Action item handlers
-  const handleApprove = (actionId, e) => {
+  const handleApprove = async (actionId, e) => {
     e?.stopPropagation()
-    transcriptStore.updateActionItemStatus(transcript.id, actionId, 'Approved')
-    loadData()
+    await api.approveActionItem(transcript.id, actionId)
+    await loadData()
   }
 
-  const handleReject = (actionId, e) => {
+  const handleReject = async (actionId, e) => {
     e?.stopPropagation()
-    transcriptStore.updateActionItemStatus(transcript.id, actionId, 'Rejected')
-    loadData()
+    await api.rejectActionItem(transcript.id, actionId)
+    await loadData()
   }
 
   const startEditAction = action => {
@@ -103,10 +110,10 @@ export default function MeetingAnalysis() {
     })
   }
 
-  const saveEditAction = actionId => {
-    transcriptStore.editActionItem(transcript.id, actionId, editForm)
+  const saveEditAction = async actionId => {
+    await api.editActionItem(transcript.id, actionId, editForm)
     setEditingActionId(null)
-    loadData()
+    await loadData()
   }
 
   const handleCopyTranscript = () => {

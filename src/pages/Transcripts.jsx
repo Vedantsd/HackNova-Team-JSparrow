@@ -16,6 +16,7 @@ import {
   X
 } from 'lucide-react'
 import Modal from '../components/Modal.jsx'
+import { api } from '../services/api.js'
 import { transcriptStore } from '../services/transcriptStore.js'
 
 export default function Transcripts() {
@@ -28,6 +29,7 @@ export default function Transcripts() {
   const [statusFilter, setStatusFilter] = useState('all') // 'all' | 'Uploaded' | 'Processing' | 'Processed' | 'Failed'
   const [showUploadModal, setShowUploadModal] = useState(false)
   const [successToast, setSuccessToast] = useState('')
+  const [health, setHealth] = useState(null)
 
   // Upload Modal State
   const [selectedFile, setSelectedFile] = useState(null)
@@ -39,11 +41,20 @@ export default function Transcripts() {
   const [isUploading, setIsUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
 
-  // Load transcripts
-  const refreshList = () => {
-    const list = transcriptStore.getTranscripts()
-    setTranscripts(list)
-    setLoading(false)
+  // Load transcripts & backend health
+  const refreshList = async () => {
+    try {
+      const [list, h] = await Promise.all([
+        api.listTranscripts(),
+        api.getHealth()
+      ])
+      if (Array.isArray(list)) setTranscripts(list)
+      if (h) setHealth(h)
+    } catch {
+      setTranscripts(transcriptStore.getTranscripts())
+    } finally {
+      setLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -119,7 +130,7 @@ export default function Transcripts() {
     }
   }
 
-  const handleUploadSubmit = e => {
+  const handleUploadSubmit = async e => {
     e.preventDefault()
     if (!formTitle.trim()) {
       setFileError('Please enter a meeting title.')
@@ -133,8 +144,7 @@ export default function Transcripts() {
 
     setIsUploading(true)
 
-    // Simulate reliable upload process
-    setTimeout(() => {
+    try {
       const fileSizeFormatted = selectedFile 
         ? `${(selectedFile.size / 1024).toFixed(1)} KB` 
         : `${(new Blob([pastedText]).size / 1024).toFixed(1)} KB`
@@ -143,7 +153,7 @@ export default function Transcripts() {
         ? selectedFile.name.split('.').pop().toUpperCase() 
         : 'TXT'
 
-      const newTx = transcriptStore.addTranscript({
+      const newTx = await api.uploadTranscript({
         title: formTitle,
         filename: selectedFile ? selectedFile.name : `${formTitle.toLowerCase().replace(/[^a-z0-9]/g, '_')}.txt`,
         fileSize: fileSizeFormatted,
@@ -164,16 +174,19 @@ export default function Transcripts() {
       setPastedText('')
       setFileError('')
 
-      refreshList()
-      setSuccessToast(`"${newTx.title}" uploaded successfully! AI analysis is now processing.`)
+      await refreshList()
+      setSuccessToast(`"${newTx?.title || formTitle}" uploaded successfully! AI analysis is now processing.`)
       setTimeout(() => setSuccessToast(''), 5000)
-    }, 600)
+    } catch (err) {
+      setIsUploading(false)
+      setFileError(`Upload failed: ${err.message || 'Unknown error'}`)
+    }
   }
 
-  const handleRetry = (id, e) => {
+  const handleRetry = async (id, e) => {
     e.stopPropagation()
-    transcriptStore.retryProcessing(id)
-    refreshList()
+    await api.retryTranscriptProcessing(id)
+    await refreshList()
   }
 
   // Filter & Search logic
