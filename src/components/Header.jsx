@@ -13,16 +13,21 @@ import {
   FileText, 
   Check, 
   Clock, 
-  ExternalLink 
+  ExternalLink,
+  ShieldCheck,
+  LogOut,
+  User
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useTheme } from '../theme.jsx'
+import { useAuth } from '../context/AuthContext.jsx'
 import Modal from './Modal.jsx'
 import { api } from '../services/api.js'
 
 export default function Header({ query, setQuery, onMenu }) {
   const nav = useNavigate()
   const { theme, setTheme } = useTheme()
+  const { user, logout, isAdmin } = useAuth()
   const [modal, setModal] = useState(false)
   const [bell, setBell] = useState(false)
   const [notifications, setNotifications] = useState([])
@@ -233,11 +238,74 @@ export default function Header({ query, setQuery, onMenu }) {
         <Settings size={17} />
       </button>
 
+      {/* Admin Portal (Visible strictly to authenticated Administrators) */}
+      {isAdmin && (
+        <button
+          className="btn"
+          onClick={() => nav('/admin')}
+          title="Open Admin Portal"
+          style={{
+            borderColor: 'rgba(99, 102, 241, 0.4)',
+            background: 'rgba(99, 102, 241, 0.08)'
+          }}
+        >
+          <ShieldCheck size={16} style={{ color: 'var(--color-primary)' }} />
+          <span className="hide-sm">Admin Portal</span>
+        </button>
+      )}
+
       {/* New Meeting */}
       <button className="btn primary" onClick={() => setModal(true)}>
         <Plus size={16} />
         <span className="hide-sm">New Meeting</span>
       </button>
+
+      {/* User Profile & Logout */}
+      {user && (
+        <div className="row" style={{ gap: '6px', marginLeft: '2px' }}>
+          <div
+            title={`${user.name} (${user.email}) - Role: ${user.role}`}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '2px 8px 2px 2px',
+              borderRadius: '8px',
+              background: 'var(--color-soft)',
+              border: '1px solid var(--color-border)'
+            }}
+          >
+            <div style={{
+              width: '28px',
+              height: '28px',
+              borderRadius: '6px',
+              background: isAdmin ? 'linear-gradient(135deg, #10b981, #059669)' : 'var(--color-primary)',
+              color: '#ffffff',
+              display: 'grid',
+              placeItems: 'center',
+              fontWeight: 700,
+              fontSize: '12px'
+            }}>
+              {user.name?.[0]?.toUpperCase() || 'U'}
+            </div>
+            <div className="hide-sm" style={{ textAlign: 'left', lineHeight: 1.2 }}>
+              <div style={{ fontSize: '12px', fontWeight: 600 }}>{user.name}</div>
+              <div style={{ fontSize: '10px', color: 'var(--color-muted)' }}>
+                {isAdmin ? 'Admin' : 'Member'}
+              </div>
+            </div>
+          </div>
+
+          <button
+            className="icon-btn sq"
+            onClick={async () => { await logout(); nav('/login') }}
+            title="Sign Out"
+            aria-label="Sign out"
+          >
+            <LogOut size={14} style={{ color: 'var(--color-danger)' }} />
+          </button>
+        </div>
+      )}
 
       {modal && (
         <Modal title="New meeting" onClose={() => setModal(false)}>
