@@ -161,15 +161,36 @@ def analyze_transcript(transcript_text: str, meeting_title: str) -> dict:
         client = genai.Client(api_key=api_key)
         prompt = build_prompt(transcript_text, meeting_title)
 
-        logger.info(f"Calling Gemini API using model '{model_name}'...")
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.2
-            )
-        )
+        # Candidate models with graceful fallback if the chosen model is sunset or overloaded
+        candidates = [model_name]
+        for fb in ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"]:
+            if fb not in candidates:
+                candidates.append(fb)
+
+        response = None
+        used_model = model_name
+        last_err = None
+
+        for cand in candidates:
+            try:
+                logger.info(f"Calling Gemini API using model '{cand}'...")
+                response = client.models.generate_content(
+                    model=cand,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2
+                    )
+                )
+                if response and response.text:
+                    used_model = cand
+                    break
+            except Exception as m_err:
+                last_err = m_err
+                logger.warning(f"Gemini model '{cand}' attempt failed ({m_err}). Trying fallback candidate...")
+
+        if not response or not response.text:
+            raise last_err or Exception("All Gemini candidate models failed to return content.")
 
         response_text = response.text.strip()
         # Clean markdown wrappers if model enclosed JSON in ```json ... ```
@@ -182,7 +203,7 @@ def analyze_transcript(transcript_text: str, meeting_title: str) -> dict:
         # Validate against Pydantic schema
         validated = TranscriptAnalysisResult.model_validate(raw_json)
         result_dict = validated.model_dump()
-        result_dict["aiEngine"] = f"Google Gemini ({model_name})"
+        result_dict["aiEngine"] = f"Google Gemini ({used_model})"
         
         # Calculate estimated duration
         lines = [l for l in transcript_text.splitlines() if l.strip()]
@@ -311,6 +332,6 @@ def fallback_heuristic_analysis(text: str, title: str, reason: str = "") -> dict
         "unresolvedQuestions": unresolved,
         "participants": participants,
         "duration": f"{max(15, len(lines) * 2)} min",
-        "aiEngine": "Rule-based analysis engine (GEMINI_API_KEY not configured in .env)",
+        "aiEngine": f"Rule-based analysis engine ({reason})" if reason else "Rule-based analysis engine",
         "fallbackReason": reason
     }
