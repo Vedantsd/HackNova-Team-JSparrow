@@ -25,11 +25,7 @@ logger = logging.getLogger("commitflow.server")
 
 DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dist"))
 
-app = Flask(
-    __name__,
-    static_folder=DIST_DIR if os.path.exists(DIST_DIR) else None,
-    static_url_path="/"
-)
+app = Flask(__name__, static_folder=None)
 # Enable CORS for frontend requests
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
