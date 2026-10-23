@@ -16,6 +16,13 @@ from psycopg2.extras import RealDictCursor
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
+try:
+    import owner_matcher
+    import conflict_detector
+except ImportError:
+    from server import owner_matcher
+    from server import conflict_detector
+
 load_dotenv()
 
 logger = logging.getLogger("commitflow.db")
@@ -281,6 +288,40 @@ def init_schema():
     ALTER TABLE meetings ADD COLUMN IF NOT EXISTS team_id VARCHAR(64) REFERENCES teams(id) ON DELETE SET NULL;
     ALTER TABLE action_items ADD COLUMN IF NOT EXISTS assignee_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
 
+    -- Trello Integration Settings & Task Linkage
+    CREATE TABLE IF NOT EXISTS trello_config (
+        key VARCHAR(64) PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS trello_card_id VARCHAR(64);
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS trello_card_url TEXT;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS trello_last_synced TIMESTAMP WITH TIME ZONE;
+    CREATE INDEX IF NOT EXISTS idx_action_items_trello ON action_items(trello_card_id);
+
+    -- Safe migrations for enhanced AI task workflow
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS item_type VARCHAR(32) DEFAULT 'commitment';
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS approved_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP WITH TIME ZONE;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN DEFAULT FALSE;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS duplicate_warning TEXT;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS duplicate_of VARCHAR(64);
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS is_conflict BOOLEAN DEFAULT FALSE;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS conflict_warning TEXT;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS confidence_score NUMERIC(4, 2) DEFAULT 0.90;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS related_decision_id VARCHAR(64);
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS follow_up_notes TEXT;
+    CREATE INDEX IF NOT EXISTS idx_action_items_type ON action_items(item_type);
+
+    -- Safe migrations for unresolved questions and follow-ups lifecycle
+    ALTER TABLE unresolved_questions ADD COLUMN IF NOT EXISTS status VARCHAR(32) DEFAULT 'Pending';
+    ALTER TABLE unresolved_questions ADD COLUMN IF NOT EXISTS resolved_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE unresolved_questions ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;
+    ALTER TABLE unresolved_questions ADD COLUMN IF NOT EXISTS resolution_notes TEXT;
+    ALTER TABLE unresolved_questions ADD COLUMN IF NOT EXISTS assigned_owner_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE unresolved_questions ADD COLUMN IF NOT EXISTS target_deadline VARCHAR(64);
+    CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_questions(status);
+
     -- Indexes for fast filtering and status querying
     CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
     CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
@@ -312,10 +353,10 @@ def init_schema():
             cur.execute(schema_sql)
             logger.info("Neon PostgreSQL schema initialized successfully.")
         
-        seed_default_data_if_empty()
-        seed_default_meetings()
+        # Purely dynamic setup: seed required authentication identities and roles
         bootstrap_admin_from_env_if_set()
         seed_team_lead_and_teams()
+        seed_hacknova_team_users()
         return True
     except Exception as e:
         logger.error(f"Failed to initialize schema in PostgreSQL: {e}")
@@ -454,9 +495,19 @@ def get_transcript_by_id(transcript_id, user_id=None, is_admin=False):
 
         # Unresolved Questions
         cur.execute("""
-            SELECT id, title, category, description, evidence
-            FROM unresolved_questions
-            WHERE transcript_id = %s;
+            SELECT uq.id, uq.title, uq.category, uq.description, uq.evidence,
+                   uq.status, uq.resolved_by as "resolvedBy",
+                   u_res.name as "resolverName",
+                   to_char(uq.resolved_at, 'YYYY-MM-DD HH24:MI:SS') as "resolvedAt",
+                   uq.resolution_notes as "resolutionNotes",
+                   uq.assigned_owner_id as "assignedOwnerId",
+                   u_own.name as "assignedOwnerName",
+                   uq.target_deadline as "targetDeadline"
+            FROM unresolved_questions uq
+            LEFT JOIN users u_res ON uq.resolved_by = u_res.id
+            LEFT JOIN users u_own ON uq.assigned_owner_id = u_own.id
+            WHERE uq.transcript_id = %s
+            ORDER BY uq.created_at ASC;
         """, (transcript_id,))
         unres_rows = cur.fetchall()
         result['unresolvedQuestions'] = [dict(r) for r in unres_rows]
@@ -543,28 +594,80 @@ def save_analysis_results(transcript_id, analysis_data):
                 ev.get('quote', '')
             ))
 
-        # 4. Clean and insert action items
+        # 4. Clean and insert action items with owner matching and duplicate/conflict detection
         cur.execute("DELETE FROM action_items WHERE transcript_id = %s;", (transcript_id,))
-        action_items = analysis_data.get('actionItems', [])
-        for a in action_items:
+        raw_action_items = analysis_data.get('actionItems', [])
+
+        # Fetch active users for owner matching
+        cur.execute("SELECT id, name, email, role FROM users WHERE status = 'active';")
+        active_users = [dict(r) for r in cur.fetchall()]
+
+        # Fetch existing action items across DB to test duplicates
+        cur.execute("""
+            SELECT id, title, description, owner, deadline, status, trello_card_id as "trelloCardId"
+            FROM action_items 
+            WHERE transcript_id != %s;
+        """, (transcript_id,))
+        existing_items = [dict(r) for r in cur.fetchall()]
+
+        # Match owners to real registered users
+        prepared_items = []
+        for a in raw_action_items:
+            item_copy = dict(a)
+            match_res = owner_matcher.match_owner_to_user(a.get('owner'), active_users)
+            item_copy['owner'] = match_res['owner']
+            item_copy['ownerStatus'] = match_res['owner_status']
+            item_copy['assigneeId'] = match_res['assignee_id']
+            item_copy['confidenceScore'] = match_res.get('confidence', 0.90)
+            item_copy['itemType'] = a.get('itemType', 'commitment')
+            prepared_items.append(item_copy)
+
+        # Detect duplicates and conflicts
+        annotated_items = conflict_detector.detect_duplicates_and_conflicts(
+            prepared_items,
+            existing_items,
+            decisions=analysis_data.get('decisions', [])
+        )
+
+        for a in annotated_items:
             ev = a.get('evidence') or {}
             cur.execute("""
                 INSERT INTO action_items (
-                    id, transcript_id, title, description, owner, owner_status,
-                    deadline, deadline_status, priority, status,
+                    id, transcript_id, title, description, item_type, owner, owner_status,
+                    assignee_id, deadline, deadline_status, priority, status,
+                    is_duplicate, duplicate_warning, duplicate_of,
+                    is_conflict, conflict_warning, confidence_score,
+                    related_decision_id, follow_up_notes,
                     evidence_speaker, evidence_timestamp, evidence_quote
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s
+                );
             """, (
                 a.get('id') or f"act-{transcript_id}-{os.urandom(4).hex()}",
                 transcript_id,
                 a.get('title', ''),
                 a.get('description', ''),
+                a.get('itemType', 'commitment'),
                 a.get('owner', 'Unassigned'),
                 a.get('ownerStatus', 'ambiguous'),
+                a.get('assigneeId'),
                 a.get('deadline', 'Unspecified'),
                 a.get('deadlineStatus', 'missing'),
                 a.get('priority', 'Medium'),
                 a.get('status', 'Pending Approval'),
+                a.get('is_duplicate', False),
+                a.get('duplicate_warning'),
+                a.get('duplicate_of'),
+                a.get('is_conflict', False),
+                a.get('conflict_warning'),
+                a.get('confidenceScore', 0.90),
+                a.get('relatedDecision'),
+                a.get('followUp'),
                 ev.get('speaker', ''),
                 ev.get('timestamp', ''),
                 ev.get('quote', '')
@@ -575,15 +678,20 @@ def save_analysis_results(transcript_id, analysis_data):
         unresolved = analysis_data.get('unresolvedQuestions', [])
         for u in unresolved:
             cur.execute("""
-                INSERT INTO unresolved_questions (id, transcript_id, title, category, description, evidence)
-                VALUES (%s, %s, %s, %s, %s, %s);
+                INSERT INTO unresolved_questions (
+                    id, transcript_id, title, category, description, evidence, status, assigned_owner_id, target_deadline
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
                 u.get('id') or f"unres-{transcript_id}-{os.urandom(4).hex()}",
                 transcript_id,
                 u.get('title', ''),
                 u.get('category', 'Unanswered Question'),
                 u.get('description', ''),
-                u.get('evidence', '')
+                u.get('evidence', ''),
+                u.get('status', 'Pending'),
+                u.get('assignedOwnerId') or u.get('assigned_owner_id'),
+                u.get('targetDeadline') or u.get('target_deadline')
             ))
 
         return True
@@ -603,39 +711,50 @@ def mark_transcript_failed(transcript_id, error_message):
         return True
 
 def list_all_action_items(user_id=None, is_admin=False):
-    """Retrieve all action items across permitted transcripts."""
+    """Retrieve all action items across permitted transcripts and Trello imports with full workflow metadata."""
     if not get_connection_url():
         return None
     with get_db_cursor(commit=False) as cur:
+        base_query = """
+            SELECT a.id, a.transcript_id as "sourceMeetingId", 
+                   COALESCE(t.title, m.title, 'CommitFlow Task') as "sourceMeetingTitle",
+                   a.title, a.description,
+                   COALESCE(a.item_type, 'commitment') as "itemType",
+                   a.owner, a.owner_status as "ownerStatus",
+                   a.assignee_id as "assigneeId",
+                   u.name as "assigneeName",
+                   u.email as "assigneeEmail",
+                   a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
+                   a.approved_by as "approvedBy",
+                   to_char(a.approved_at, 'Mon DD, YYYY HH12:MI AM') as "approvedAt",
+                   ap.name as "approvedByName",
+                   COALESCE(a.is_duplicate, FALSE) as "isDuplicate",
+                   a.duplicate_warning as "duplicateWarning",
+                   a.duplicate_of as "duplicateOf",
+                   COALESCE(a.is_conflict, FALSE) as "isConflict",
+                   a.conflict_warning as "conflictWarning",
+                   COALESCE(a.confidence_score, 0.90) as "confidenceScore",
+                   a.related_decision_id as "relatedDecisionId",
+                   a.follow_up_notes as "followUpNotes",
+                   a.evidence_speaker, a.evidence_timestamp, a.evidence_quote,
+                   a.trello_card_id as "trelloCardId",
+                   a.trello_card_url as "trelloCardUrl",
+                   to_char(a.trello_last_synced, 'YYYY-MM-DD HH24:MI') as "trelloLastSynced"
+            FROM action_items a
+            LEFT JOIN transcripts t ON a.transcript_id = t.id
+            LEFT JOIN meetings m ON (m.id = a.transcript_id OR m.id = t.id)
+            LEFT JOIN users u ON a.assignee_id = u.id
+            LEFT JOIN users ap ON a.approved_by = ap.id
+        """
         if is_admin:
-            cur.execute("""
-                SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
-                       a.title, a.description, a.owner, a.owner_status as "ownerStatus",
-                       a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
-                       a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
-                FROM action_items a
-                JOIN transcripts t ON a.transcript_id = t.id
-                ORDER BY a.created_at DESC;
-            """)
+            cur.execute(base_query + " ORDER BY a.created_at DESC;")
         elif user_id:
-            cur.execute("""
-                SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
-                       a.title, a.description, a.owner, a.owner_status as "ownerStatus",
-                       a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
-                       a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
-                FROM action_items a
-                JOIN transcripts t ON a.transcript_id = t.id
-                WHERE t.user_id = %s OR t.user_id IS NULL
+            cur.execute(base_query + """
+                WHERE t.user_id = %s OR t.user_id IS NULL OR a.assignee_id = %s OR m.host_id = %s
                 ORDER BY a.created_at DESC;
-            """, (user_id,))
+            """, (user_id, user_id, user_id))
         else:
-            cur.execute("""
-                SELECT a.id, a.transcript_id as "sourceMeetingId", t.title as "sourceMeetingTitle",
-                       a.title, a.description, a.owner, a.owner_status as "ownerStatus",
-                       a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
-                       a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
-                FROM action_items a
-                JOIN transcripts t ON a.transcript_id = t.id
+            cur.execute(base_query + """
                 WHERE t.user_id IS NULL
                 ORDER BY a.created_at DESC;
             """)
@@ -646,14 +765,32 @@ def list_all_action_items(user_id=None, is_admin=False):
                 "id": r['id'],
                 "title": r['title'],
                 "description": r['description'],
+                "itemType": r['itemType'],
                 "owner": r['owner'],
                 "ownerStatus": r['ownerStatus'],
+                "assigneeId": r['assigneeId'],
+                "assigneeName": r['assigneeName'],
+                "assigneeEmail": r['assigneeEmail'],
                 "deadline": r['deadline'],
                 "deadlineStatus": r['deadlineStatus'],
                 "priority": r['priority'],
                 "status": r['status'],
+                "approvedBy": r['approvedBy'],
+                "approvedAt": r['approvedAt'],
+                "approvedByName": r['approvedByName'],
+                "isDuplicate": r['isDuplicate'],
+                "duplicateWarning": r['duplicateWarning'],
+                "duplicateOf": r['duplicateOf'],
+                "isConflict": r['isConflict'],
+                "conflictWarning": r['conflictWarning'],
+                "confidenceScore": float(r['confidenceScore']) if r['confidenceScore'] is not None else 0.90,
+                "relatedDecisionId": r['relatedDecisionId'],
+                "followUpNotes": r['followUpNotes'],
                 "sourceMeetingId": r['sourceMeetingId'],
                 "sourceMeetingTitle": r['sourceMeetingTitle'],
+                "trelloCardId": r.get('trelloCardId'),
+                "trelloCardUrl": r.get('trelloCardUrl'),
+                "trelloLastSynced": r.get('trelloLastSynced'),
                 "evidence": {
                     "speaker": r['evidence_speaker'],
                     "timestamp": r['evidence_timestamp'],
@@ -662,48 +799,150 @@ def list_all_action_items(user_id=None, is_admin=False):
             })
         return items
 
-def update_action_item_status(action_id, new_status):
-    """Update approval status (Approved, Rejected, Pending Approval)."""
+def update_action_item_status(action_id, new_status, approver_id=None):
+    """Update approval status (Approved, Rejected, Pending Approval) and reviewer audit trail."""
     if not get_connection_url():
         return False
     with get_db_cursor(commit=True) as cur:
-        cur.execute("""
-            UPDATE action_items
-            SET status = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s;
-        """, (new_status, action_id))
+        if new_status == "Approved":
+            cur.execute("""
+                UPDATE action_items
+                SET status = %s,
+                    approved_by = COALESCE(%s, approved_by),
+                    approved_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s;
+            """, (new_status, approver_id, action_id))
+        else:
+            cur.execute("""
+                UPDATE action_items
+                SET status = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s;
+            """, (new_status, action_id))
         return cur.rowcount > 0
 
+def bulk_approve_action_items(action_ids, approver_id=None):
+    """Bulk approve a collection of action items with reviewer audit trail."""
+    if not get_connection_url() or not action_ids:
+        return 0
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            UPDATE action_items
+            SET status = 'Approved',
+                approved_by = COALESCE(%s, approved_by),
+                approved_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ANY(%s) AND status != 'Approved';
+        """, (approver_id, list(action_ids)))
+        return cur.rowcount
+
 def edit_action_item(action_id, updates):
-    """Edit action item details."""
+    """Edit action item details including classification, assignee, owner, deadline, and priority."""
     if not get_connection_url():
         return False
     with get_db_cursor(commit=True) as cur:
         owner = updates.get('owner')
-        owner_status = 'ambiguous' if owner == 'Unassigned' else 'confirmed' if owner else None
+        assignee_id = updates.get('assigneeId') or updates.get('assignee_id')
+        item_type = updates.get('itemType') or updates.get('item_type')
+        status = updates.get('status')
+
+        if assignee_id:
+            cur.execute("SELECT name FROM users WHERE id = %s;", (assignee_id,))
+            u_row = cur.fetchone()
+            if u_row:
+                owner = u_row['name']
+                owner_status = 'confirmed'
+            else:
+                owner_status = 'ambiguous' if owner == 'Unassigned' else 'confirmed' if owner else None
+        else:
+            owner_status = 'ambiguous' if owner == 'Unassigned' else 'confirmed' if owner else None
+
         deadline = updates.get('deadline')
         deadline_status = 'missing' if deadline == 'Unspecified' else 'confirmed' if deadline else None
 
         cur.execute("""
             UPDATE action_items
             SET title = COALESCE(%s, title),
+                description = COALESCE(%s, description),
+                item_type = COALESCE(%s, item_type),
                 owner = COALESCE(%s, owner),
                 owner_status = COALESCE(%s, owner_status),
+                assignee_id = CASE WHEN %s IS NOT NULL THEN %s ELSE assignee_id END,
                 deadline = COALESCE(%s, deadline),
                 deadline_status = COALESCE(%s, deadline_status),
                 priority = COALESCE(%s, priority),
+                status = COALESCE(%s, status),
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = %s;
         """, (
             updates.get('title'),
+            updates.get('description'),
+            item_type,
             owner,
             owner_status,
+            assignee_id, assignee_id,
             deadline,
             deadline_status,
             updates.get('priority'),
+            status,
             action_id
         ))
         return cur.rowcount > 0
+
+def list_active_users():
+    """Retrieve active registered users for task assignment dropdowns."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT id, name, email, role, status
+            FROM users
+            WHERE status = 'active'
+            ORDER BY name ASC;
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+def get_action_items_for_export(transcript_id=None, team_id=None, only_approved=True):
+    """Retrieve structured task records for CSV or JSON download."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        query = """
+            SELECT a.id as "taskId",
+                   a.title as "taskTitle",
+                   COALESCE(a.description, '') as "description",
+                   COALESCE(a.item_type, 'commitment') as "classification",
+                   a.status as "approvalStatus",
+                   COALESCE(a.priority, 'Medium') as "priority",
+                   COALESCE(u.name, a.owner) as "assignedOwner",
+                   COALESCE(u.email, '') as "ownerEmail",
+                   COALESCE(a.deadline, 'Unspecified') as "dueDate",
+                   COALESCE(m.title, t.title, 'CommitFlow Meeting') as "sourceMeeting",
+                   COALESCE(a.trello_card_id, '') as "trelloCardId",
+                   COALESCE(a.trello_card_url, '') as "trelloCardUrl",
+                   to_char(a.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   to_char(a.approved_at, 'YYYY-MM-DD HH24:MI:SS') as "approvedAt",
+                   COALESCE(ap.name, '') as "approvedByName"
+            FROM action_items a
+            LEFT JOIN transcripts t ON a.transcript_id = t.id
+            LEFT JOIN meetings m ON (m.id = a.transcript_id OR m.id = t.id)
+            LEFT JOIN users u ON a.assignee_id = u.id
+            LEFT JOIN users ap ON a.approved_by = ap.id
+            WHERE 1=1
+        """
+        params = []
+        if only_approved:
+            query += " AND a.status = 'Approved'"
+        if transcript_id:
+            query += " AND (a.transcript_id = %s OR t.id = %s)"
+            params.extend([transcript_id, transcript_id])
+        if team_id:
+            query += " AND (m.team_id = %s OR a.assignee_id IN (SELECT user_id FROM team_members WHERE team_id = %s))"
+            params.extend([team_id, team_id])
+
+        query += " ORDER BY a.created_at DESC;"
+        cur.execute(query, tuple(params))
+        return [dict(r) for r in cur.fetchall()]
 
 def seed_default_data_if_empty():
     """Seed initial demonstration records if database table is brand new."""
@@ -914,6 +1153,87 @@ def seed_team_lead_and_teams():
 
     except Exception as e:
         logger.warning(f"Team Lead / Team bootstrap notice: {e}")
+
+def seed_hacknova_team_users():
+    """
+    Safely and idempotently seed the 4 requested team members into Neon PostgreSQL:
+    1. Swapnil Ingole
+    2. Aniket Bhujad
+    3. Vedant Desai
+    4. Bhoomi Tiple
+    Preserves all existing foreign keys, meetings, and transcript history.
+    """
+    if not get_connection_url():
+        return []
+
+    required_members = [
+        {"name": "Swapnil Ingole", "email": "swapnilingole008@gmail.com", "alt_email": "swapnil@commitflow.dev", "role": "user"},
+        {"name": "Aniket Bhujad", "email": "aniket@commitflow.dev", "role": "team_lead"},
+        {"name": "Vedant Desai", "email": "vedant@commitflow.dev", "role": "user"},
+        {"name": "Bhoomi Tiple", "email": "bhoomi@commitflow.dev", "role": "user"}
+    ]
+
+    seeded = []
+    default_pwd_hash = generate_password_hash("Password@2026!")
+
+    try:
+        with get_db_cursor(commit=True) as cur:
+            # 1. Ensure team exists
+            team_id = "team-hacknova"
+            cur.execute("SELECT id FROM teams WHERE id = %s;", (team_id,))
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO teams (id, name, description)
+                    VALUES (%s, 'HACKNOVA Core Team', 'Core development team for HACKNOVA 2026 AI Task Automation.');
+                """, (team_id,))
+
+            for m in required_members:
+                # Check by name or email
+                cur.execute("""
+                    SELECT id, name, email, role FROM users 
+                    WHERE LOWER(name) = LOWER(%s) OR email = %s OR email = %s;
+                """, (m["name"], m["email"], m.get("alt_email", m["email"])))
+                existing = cur.fetchone()
+
+                if existing:
+                    u_id = existing["id"]
+                    cur.execute("UPDATE users SET name = %s WHERE id = %s;", (m["name"], u_id))
+                    seeded.append({"id": u_id, "name": m["name"], "email": existing["email"], "role": existing["role"], "action": "existing"})
+                else:
+                    u_id = f"usr-{uuid.uuid4().hex[:12]}"
+                    cur.execute("""
+                        INSERT INTO users (id, name, email, password_hash, role, status)
+                        VALUES (%s, %s, %s, %s, %s, 'active')
+                        RETURNING id, name, email, role;
+                    """, (u_id, m["name"], m["email"], default_pwd_hash, m["role"]))
+                    row = cur.fetchone()
+                    seeded.append({"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "action": "created"})
+
+                # Add to team_members
+                cur.execute("""
+                    INSERT INTO team_members (team_id, user_id, role)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (team_id, user_id) DO NOTHING;
+                """, (team_id, u_id, "lead" if m["role"] == "team_lead" else "member"))
+
+                # Also add to Engineering Core team
+                cur.execute("""
+                    INSERT INTO team_members (team_id, user_id, role)
+                    VALUES ('team-engineering', %s, 'member')
+                    ON CONFLICT (team_id, user_id) DO NOTHING;
+                """, (u_id,))
+
+            # Set Aniket as lead of team-hacknova
+            for s in seeded:
+                if s["name"] == "Aniket Bhujad":
+                    cur.execute("UPDATE teams SET lead_id = %s WHERE id = %s;", (s["id"], team_id))
+                    break
+
+            logger.info(f"HACKNOVA team seeding complete: {[s['name'] for s in seeded]}")
+            return seeded
+    except Exception as e:
+        logger.error(f"Error seeding HACKNOVA team users: {e}")
+        return []
 
 def create_user(name, email, password, role="user"):
     """
@@ -2313,4 +2633,269 @@ def get_available_users_for_team(team_id):
         return [dict(r) for r in cur.fetchall()]
 
 
+# -------------------------------------------------------------
+# Trello Integration Functions
+# -------------------------------------------------------------
 
+def get_trello_settings():
+    """Retrieve Trello configuration from DB merged with environment defaults."""
+    settings = {
+        "apiKey": os.getenv("TRELLO_API_KEY", "").strip(),
+        "apiSecret": os.getenv("TRELLO_API_SECRET", "").strip(),
+        "token": os.getenv("TRELLO_TOKEN", "").strip(),
+        "boardId": os.getenv("TRELLO_BOARD_ID", "").strip(),
+        "boardName": "CommitFlow Tasks",
+        "boardUrl": "",
+        "listTodoId": "",
+        "listDoingId": "",
+        "listDoneId": "",
+        "lastSyncedAt": ""
+    }
+    
+    if not get_connection_url():
+        return settings
+
+    try:
+        with get_db_cursor(commit=False) as cur:
+            cur.execute("SELECT key, value FROM trello_config;")
+            for r in cur.fetchall():
+                k, v = r["key"], r["value"]
+                if k == "token" and v:
+                    settings["token"] = v
+                elif k == "board_id" and v:
+                    settings["boardId"] = v
+                elif k == "board_name" and v:
+                    settings["boardName"] = v
+                elif k == "board_url" and v:
+                    settings["boardUrl"] = v
+                elif k == "list_todo_id" and v:
+                    settings["listTodoId"] = v
+                elif k == "list_doing_id" and v:
+                    settings["listDoingId"] = v
+                elif k == "list_done_id" and v:
+                    settings["listDoneId"] = v
+                elif k == "last_synced_at" and v:
+                    settings["lastSyncedAt"] = v
+    except Exception as e:
+        logger.warning(f"Error fetching trello_config: {e}")
+        
+    return settings
+
+def save_trello_setting(key, value):
+    """Save or update a Trello configuration value in database."""
+    if not get_connection_url():
+        return False
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO trello_config (key, value, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;
+        """, (key, str(value) if value is not None else ""))
+        return True
+
+def link_action_item_trello(action_id, trello_card_id, trello_card_url):
+    """Link an action item with its corresponding Trello card ID and URL."""
+    if not get_connection_url():
+        return False
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            UPDATE action_items
+            SET trello_card_id = %s, trello_card_url = %s, trello_last_synced = CURRENT_TIMESTAMP
+            WHERE id = %s;
+        """, (trello_card_id, trello_card_url, action_id))
+        return cur.rowcount > 0
+
+def upsert_action_item_from_trello(trello_card_id, title, description, status="Pending Approval", deadline=None, trello_card_url=None):
+    """Create or update an action item imported from Trello."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id FROM action_items WHERE trello_card_id = %s;", (trello_card_id,))
+        existing = cur.fetchone()
+        
+        if existing:
+            action_id = existing["id"]
+            cur.execute("""
+                UPDATE action_items
+                SET title = %s, description = %s, status = %s, deadline = COALESCE(%s, deadline),
+                    trello_card_url = %s, trello_last_synced = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING id, title, status, trello_card_id;
+            """, (title, description, status, deadline, trello_card_url, action_id))
+            return dict(cur.fetchone())
+        else:
+            action_id = f"act-trello-{uuid.uuid4().hex[:8]}"
+            cur.execute("""
+                INSERT INTO action_items (id, transcript_id, title, description, owner, owner_status, deadline, deadline_status, priority, status, trello_card_id, trello_card_url, trello_last_synced)
+                VALUES (%s, NULL, %s, %s, 'Trello Sync', 'confirmed', %s, 'confirmed', 'Medium', %s, %s, %s, CURRENT_TIMESTAMP)
+                RETURNING id, title, status, trello_card_id;
+            """, (action_id, title, description, deadline, status, trello_card_id, trello_card_url))
+            return dict(cur.fetchone())
+
+def list_action_items_with_trello(user_id=None, is_admin=False):
+    """Retrieve all action items including Trello card metadata."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT a.id, a.transcript_id as "transcriptId", a.title, a.description,
+                   a.owner, a.owner_status as "ownerStatus",
+                   a.deadline, a.deadline_status as "deadlineStatus",
+                   a.priority, a.status,
+                   a.evidence_speaker as "evidenceSpeaker",
+                   a.evidence_timestamp as "evidenceTimestamp",
+                   a.evidence_quote as "evidenceQuote",
+                   a.trello_card_id as "trelloCardId",
+                   a.trello_card_url as "trelloCardUrl",
+                   to_char(a.trello_last_synced, 'YYYY-MM-DD HH24:MI') as "trelloLastSynced",
+                   COALESCE(m.title, t.title, 'CommitFlow Meeting') as "sourceMeetingTitle"
+            FROM action_items a
+            LEFT JOIN transcripts t ON a.transcript_id = t.id
+            LEFT JOIN meetings m ON (m.id = a.transcript_id OR m.id = t.id)
+            ORDER BY a.created_at DESC;
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+def list_unresolved_questions(user_id=None, is_admin=False, is_team_lead=False, status_filter=None):
+    """
+    Retrieve unresolved questions and follow-ups from transcripts the user has access to.
+    Joins on transcripts, meetings, and users (for resolver and assigned owner).
+    """
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        query = """
+            SELECT uq.id,
+                   uq.transcript_id as "transcriptId",
+                   uq.title,
+                   uq.category,
+                   uq.description,
+                   uq.evidence,
+                   uq.status,
+                   uq.resolved_by as "resolvedBy",
+                   u_res.name as "resolverName",
+                   to_char(uq.resolved_at, 'YYYY-MM-DD HH24:MI:SS') as "resolvedAt",
+                   uq.resolution_notes as "resolutionNotes",
+                   uq.assigned_owner_id as "assignedOwnerId",
+                   u_own.name as "assignedOwnerName",
+                   uq.target_deadline as "targetDeadline",
+                   to_char(uq.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   COALESCE(m.title, t.title, 'CommitFlow Meeting') as "sourceMeetingTitle",
+                   COALESCE(m.id, t.id) as "sourceMeetingId"
+            FROM unresolved_questions uq
+            LEFT JOIN transcripts t ON uq.transcript_id = t.id
+            LEFT JOIN meetings m ON (m.id = uq.transcript_id OR m.id = t.id)
+            LEFT JOIN users u_res ON uq.resolved_by = u_res.id
+            LEFT JOIN users u_own ON uq.assigned_owner_id = u_own.id
+        """
+        params = []
+        conditions = []
+        if status_filter:
+            conditions.append("uq.status = %s")
+            params.append(status_filter)
+        
+        # Access control
+        if not is_admin:
+            if is_team_lead and user_id:
+                conditions.append("""
+                    (t.user_id = %s OR m.host_id = %s OR EXISTS (
+                        SELECT 1 FROM team_members tm
+                        JOIN teams tm_t ON tm.team_id = tm_t.id
+                        WHERE tm_t.lead_id = %s AND (tm.user_id = t.user_id OR tm.user_id = m.host_id)
+                    ) OR NOT COALESCE(m.is_private, FALSE))
+                """)
+                params.extend([user_id, user_id, user_id])
+            elif user_id:
+                conditions.append("""
+                    (t.user_id = %s OR m.host_id = %s OR NOT COALESCE(m.is_private, FALSE) OR EXISTS (
+                        SELECT 1 FROM meeting_participants mp WHERE mp.meeting_id = m.id AND mp.user_id = %s
+                    ))
+                """)
+                params.extend([user_id, user_id, user_id])
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        query += " ORDER BY uq.created_at DESC;"
+        cur.execute(query, tuple(params))
+        return [dict(r) for r in cur.fetchall()]
+
+def update_unresolved_question(question_id, updates, resolver_id=None):
+    """
+    Update an unresolved question / follow-up item.
+    Supports updating status ('Pending', 'In Progress', 'Resolved'), resolution_notes,
+    assigned_owner_id, and target_deadline.
+    """
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id, status FROM unresolved_questions WHERE id = %s;", (question_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        status = updates.get("status")
+        resolution_notes = updates.get("resolution_notes") if "resolution_notes" in updates else updates.get("resolutionNotes")
+        assigned_owner_id = updates.get("assigned_owner_id") if "assigned_owner_id" in updates else updates.get("assignedOwnerId")
+        target_deadline = updates.get("target_deadline") if "target_deadline" in updates else updates.get("targetDeadline")
+
+        set_clauses = []
+        params = []
+
+        if status is not None:
+            set_clauses.append("status = %s")
+            params.append(status)
+            if status == "Resolved":
+                set_clauses.append("resolved_by = %s")
+                params.append(resolver_id)
+                set_clauses.append("resolved_at = CURRENT_TIMESTAMP")
+            elif status == "Pending":
+                set_clauses.append("resolved_by = NULL")
+                set_clauses.append("resolved_at = NULL")
+
+        if resolution_notes is not None:
+            set_clauses.append("resolution_notes = %s")
+            params.append(resolution_notes)
+
+        if assigned_owner_id is not None:
+            val = assigned_owner_id if assigned_owner_id else None
+            set_clauses.append("assigned_owner_id = %s")
+            params.append(val)
+
+        if target_deadline is not None:
+            set_clauses.append("target_deadline = %s")
+            params.append(target_deadline if target_deadline else None)
+
+        if not set_clauses:
+            return dict(row)
+
+        params.append(question_id)
+        query = f"""
+            UPDATE unresolved_questions
+            SET {', '.join(set_clauses)}
+            WHERE id = %s
+            RETURNING id, transcript_id as "transcriptId", title, category, description, evidence,
+                      status, resolved_by as "resolvedBy", to_char(resolved_at, 'YYYY-MM-DD HH24:MI:SS') as "resolvedAt",
+                      resolution_notes as "resolutionNotes", assigned_owner_id as "assignedOwnerId",
+                      target_deadline as "targetDeadline";
+        """
+        cur.execute(query, tuple(params))
+        updated = cur.fetchone()
+        return dict(updated) if updated else None
+
+def create_unresolved_question(transcript_id, title, category="Follow-up Action", description="", evidence="", assigned_owner_id=None, target_deadline=None):
+    """Create a new follow-up action or unresolved question."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=True) as cur:
+        q_id = f"uq-{uuid.uuid4().hex[:8]}"
+        cur.execute("""
+            INSERT INTO unresolved_questions (
+                id, transcript_id, title, category, description, evidence,
+                status, assigned_owner_id, target_deadline
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'Pending', %s, %s)
+            RETURNING id, transcript_id as "transcriptId", title, category, description, evidence,
+                      status, assigned_owner_id as "assignedOwnerId", target_deadline as "targetDeadline";
+        """, (q_id, transcript_id, title, category, description, evidence, assigned_owner_id or None, target_deadline or None))
+        row = cur.fetchone()
+        return dict(row) if row else None

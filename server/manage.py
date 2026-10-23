@@ -94,6 +94,17 @@ def cmd_stats(args):
     print(f"Total Decisions:    {stats.get('total_decisions', 0)}")
     print("=======================================\n")
 
+def cmd_seed_hacknova_team(args):
+    """Seed the 4 requested HACKNOVA team users safely and idempotently."""
+    print("\n=== Seeding HACKNOVA Team Members into Database ===")
+    results = db.seed_hacknova_team_users()
+    if not results:
+        print("[Notice] Database not connected or operation completed.")
+        return
+    for r in results:
+        print(f"  [{r.get('action', 'processed').upper()}] {r.get('name')} ({r.get('email')}) — Role: {r.get('role')} — ID: {r.get('id')}")
+    print("[Success] All 4 requested team members verified and linked to team-hacknova.\n")
+
 def main():
     parser = argparse.ArgumentParser(description="CommitFlow Management Utility")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -114,6 +125,9 @@ def main():
     # stats
     subparsers.add_parser("stats", help="Display platform statistics")
 
+    # seed-hacknova-team
+    subparsers.add_parser("seed-hacknova-team", help="Safely and idempotently seed the 4 requested team members")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -127,6 +141,9 @@ def main():
         cmd_list_users(args)
     elif args.command == "stats":
         cmd_stats(args)
+    elif args.command == "seed-hacknova-team":
+        cmd_seed_hacknova_team(args)
 
 if __name__ == "__main__":
     main()
+

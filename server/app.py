@@ -9,7 +9,9 @@ import logging
 import uuid
 from functools import wraps
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, send_from_directory
+import csv
+import io
+from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -17,10 +19,12 @@ try:
     import db
     import ai
     import livekit_service
+    import trello_service
 except ImportError:
     from server import db
     from server import ai
     from server import livekit_service
+    from server import trello_service
 
 load_dotenv()
 
@@ -270,6 +274,8 @@ def health_check():
     ai_ok, ai_msg = ai.check_gemini_status()
     _, model_name = ai.get_gemini_config()
     lk_ok, lk_msg = livekit_service.check_livekit_status()
+    trello_token = trello_service.get_active_token()
+    trello_settings = db.get_trello_settings()
 
     return jsonify({
         "status": "ok",
@@ -287,6 +293,12 @@ def health_check():
         "livekit": {
             "configured": lk_ok,
             "message": lk_msg
+        },
+        "trello": {
+            "configured": bool(trello_settings.get("apiKey")),
+            "connected": bool(trello_token),
+            "boardName": trello_settings.get("boardName", "CommitFlow Tasks"),
+            "boardUrl": trello_settings.get("boardUrl", "")
         }
     }), 200
 
@@ -613,22 +625,115 @@ def list_action_items_endpoint():
             items.append(a)
     return jsonify(items), 200
 
+def _sync_action_item_to_trello(action_id, status=None, title=None, desc=None):
+    """Background helper to reflect action item updates on corresponding Trello card."""
+    def _worker():
+        try:
+            if not db.get_connection_url():
+                return
+            with db.get_db_cursor(commit=False) as cur:
+                cur.execute("SELECT trello_card_id FROM action_items WHERE id = %s;", (action_id,))
+                row = cur.fetchone()
+                if row and row.get("trello_card_id"):
+                    trello_service.update_card(row["trello_card_id"], title=title, description=desc, status=status)
+        except Exception as e:
+            logger.warning(f"Failed to sync action item to Trello: {e}")
+    threading.Thread(target=_worker, daemon=True).start()
+
 @app.route("/api/action-items/<action_id>/approve", methods=["POST"])
 def approve_action_item_endpoint(action_id):
-    """Approve action item (human-in-the-loop task governance)."""
+    """Approve action item (human-in-the-loop task governance) with audit logging."""
+    user = get_current_user()
+    approver_id = user["id"] if user else None
+    approver_name = user.get("name") if user else "Authorized Reviewer"
+
     if db.get_connection_url():
-        success = db.update_action_item_status(action_id, "Approved")
+        success = db.update_action_item_status(action_id, "Approved", approver_id=approver_id)
         if success:
-            return jsonify({"id": action_id, "status": "Approved"}), 200
+            _sync_action_item_to_trello(action_id, status="Approved")
+            return jsonify({"id": action_id, "status": "Approved", "approvedBy": approver_name}), 200
 
     # Fallback
     for tx in _mem_store["transcripts"].values():
         for a in tx.get("actionItems", []):
             if a.get("id") == action_id:
                 a["status"] = "Approved"
-                return jsonify({"id": action_id, "status": "Approved"}), 200
+                a["approvedByName"] = approver_name
+                return jsonify({"id": action_id, "status": "Approved", "approvedBy": approver_name}), 200
 
     return jsonify({"error": "Action item not found."}), 404
+
+@app.route("/api/action-items/bulk-approve", methods=["POST"])
+def bulk_approve_action_items_endpoint():
+    """Bulk approve multiple eligible action items with reviewer audit trail."""
+    data = request.get_json(silent=True) or {}
+    action_ids = data.get("actionIds", [])
+    if not action_ids:
+        return jsonify({"error": "actionIds list is required."}), 400
+
+    user = get_current_user()
+    approver_id = user["id"] if user else None
+    approver_name = user.get("name") if user else "Authorized Reviewer"
+
+    if db.get_connection_url():
+        approved_count = db.bulk_approve_action_items(action_ids, approver_id=approver_id)
+        for act_id in action_ids:
+            _sync_action_item_to_trello(act_id, status="Approved")
+        return jsonify({
+            "message": f"Successfully approved {approved_count} action item(s).",
+            "approvedCount": approved_count,
+            "approvedBy": approver_name
+        }), 200
+
+    # Fallback
+    approved_count = 0
+    for tx in _mem_store["transcripts"].values():
+        for a in tx.get("actionItems", []):
+            if a.get("id") in action_ids and a.get("status") != "Approved":
+                a["status"] = "Approved"
+                a["approvedByName"] = approver_name
+                approved_count += 1
+    return jsonify({
+        "message": f"Successfully approved {approved_count} action item(s).",
+        "approvedCount": approved_count,
+        "approvedBy": approver_name
+    }), 200
+
+@app.route("/api/action-items/export", methods=["GET"])
+def export_action_items_endpoint():
+    """Export approved action items as CSV or structured JSON file."""
+    export_format = request.args.get("format", "csv").lower()
+    transcript_id = request.args.get("transcriptId") or request.args.get("transcript_id")
+    only_approved = request.args.get("onlyApproved", "true").lower() in ("true", "1", "yes")
+
+    items = db.get_action_items_for_export(transcript_id=transcript_id, only_approved=only_approved)
+
+    if export_format == "json":
+        return jsonify({
+            "exportDate": datetime.now(timezone.utc).isoformat(),
+            "totalItems": len(items),
+            "items": items
+        }), 200
+
+    # CSV Format
+    output = io.StringIO()
+    fieldnames = [
+        "taskId", "taskTitle", "description", "classification", "approvalStatus",
+        "priority", "assignedOwner", "ownerEmail", "dueDate", "sourceMeeting",
+        "trelloCardId", "trelloCardUrl", "createdAt", "approvedAt", "approvedByName"
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for item in items:
+        writer.writerow({k: item.get(k, "") for k in fieldnames})
+
+    csv_data = output.getvalue()
+    filename = f"commitflow_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @app.route("/api/action-items/<action_id>/reject", methods=["POST"])
 def reject_action_item_endpoint(action_id):
@@ -636,6 +741,7 @@ def reject_action_item_endpoint(action_id):
     if db.get_connection_url():
         success = db.update_action_item_status(action_id, "Rejected")
         if success:
+            _sync_action_item_to_trello(action_id, status="Rejected")
             return jsonify({"id": action_id, "status": "Rejected"}), 200
 
     # Fallback
@@ -654,6 +760,12 @@ def edit_action_item_endpoint(action_id):
     if db.get_connection_url():
         success = db.edit_action_item(action_id, updates)
         if success:
+            _sync_action_item_to_trello(
+                action_id,
+                title=updates.get("title"),
+                desc=updates.get("description"),
+                status=updates.get("status")
+            )
             return jsonify({"id": action_id, "message": "Updated successfully."}), 200
 
     # Fallback
@@ -668,9 +780,314 @@ def edit_action_item_endpoint(action_id):
                     a["deadline"] = updates["deadline"]
                     a["deadlineStatus"] = "missing" if updates["deadline"] == "Unspecified" else "confirmed"
                 if "priority" in updates: a["priority"] = updates["priority"]
+                if "itemType" in updates: a["itemType"] = updates["itemType"]
                 return jsonify({"id": action_id, "message": "Updated successfully."}), 200
 
     return jsonify({"error": "Action item not found."}), 404
+
+@app.route("/api/users/active", methods=["GET"])
+def list_active_users_endpoint():
+    """Retrieve active registered users for task assignment and reviewer dropdowns."""
+    if db.get_connection_url():
+        users = db.list_active_users()
+        return jsonify(users), 200
+    return jsonify([]), 200
+
+# -------------------------------------------------------------
+# REST API Endpoints: Unresolved Questions & Follow-ups Lifecycle
+# -------------------------------------------------------------
+
+@app.route("/api/unresolved-questions", methods=["GET"])
+@require_auth
+def list_unresolved_questions_endpoint():
+    """
+    Retrieve real persisted unresolved questions, pending follow-ups, and items awaiting clarification.
+    """
+    user = request.current_user
+    is_admin = (user.get("role") == "admin")
+    is_team_lead = (user.get("role") == "team_lead")
+    status_filter = request.args.get("status")
+
+    if db.get_connection_url():
+        questions = db.list_unresolved_questions(
+            user_id=user["id"],
+            is_admin=is_admin,
+            is_team_lead=is_team_lead,
+            status_filter=status_filter
+        )
+        return jsonify(questions), 200
+    return jsonify([]), 200
+
+@app.route("/api/unresolved-questions/<question_id>", methods=["PUT"])
+@require_auth
+def update_unresolved_question_endpoint(question_id):
+    """
+    Update lifecycle state, resolution notes, assigned owner, or target deadline of a follow-up item.
+    """
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+    
+    if db.get_connection_url():
+        updated = db.update_unresolved_question(question_id, data, resolver_id=user["id"])
+        if updated:
+            db.log_audit_event(
+                user["id"],
+                user["email"],
+                "UNRESOLVED_QUESTION_UPDATED",
+                {"questionId": question_id, "status": updated.get("status"), "resolvedBy": updated.get("resolvedBy")},
+                request.remote_addr
+            )
+            return jsonify(updated), 200
+        return jsonify({"error": "Unresolved question or follow-up item not found."}), 404
+
+    return jsonify({"error": "Database unavailable."}), 503
+
+@app.route("/api/unresolved-questions", methods=["POST"])
+@require_auth
+def create_unresolved_question_endpoint():
+    """
+    Create a new follow-up action or unresolved question linked to a transcript or meeting.
+    """
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+    transcript_id = data.get("transcriptId") or data.get("transcript_id")
+    title = data.get("title")
+
+    if not title:
+        return jsonify({"error": "Title is required for a follow-up item."}), 400
+
+    if db.get_connection_url():
+        created = db.create_unresolved_question(
+            transcript_id=transcript_id,
+            title=title,
+            category=data.get("category", "Follow-up Action"),
+            description=data.get("description", ""),
+            evidence=data.get("evidence", ""),
+            assigned_owner_id=data.get("assignedOwnerId") or data.get("assigned_owner_id"),
+            target_deadline=data.get("targetDeadline") or data.get("target_deadline")
+        )
+        if created:
+            db.log_audit_event(
+                user["id"],
+                user["email"],
+                "UNRESOLVED_QUESTION_CREATED",
+                {"questionId": created.get("id"), "title": title},
+                request.remote_addr
+            )
+            return jsonify(created), 201
+
+    return jsonify({"error": "Failed to create follow-up item."}), 500
+
+# -------------------------------------------------------------
+# REST API Endpoints: Trello Project Management Integration
+# -------------------------------------------------------------
+
+@app.route("/api/trello/status", methods=["GET"])
+def trello_status_endpoint():
+    """Return Trello integration configuration, active token status, and board details."""
+    settings = db.get_trello_settings()
+    token = trello_service.get_active_token()
+    member_info = None
+    is_valid = False
+    if token:
+        valid, info_or_err = trello_service.verify_token(token)
+        is_valid = valid
+        if valid:
+            member_info = info_or_err
+
+    return jsonify({
+        "configured": bool(settings.get("apiKey")),
+        "connected": is_valid,
+        "hasToken": bool(token),
+        "apiKey": trello_service.get_api_key(),
+        "boardId": settings.get("boardId", ""),
+        "boardName": settings.get("boardName", "CommitFlow Tasks"),
+        "boardUrl": settings.get("boardUrl", ""),
+        "lastSyncedAt": settings.get("lastSyncedAt", ""),
+        "authUrl": trello_service.get_auth_url(),
+        "member": member_info
+    }), 200
+
+@app.route("/api/trello/connect", methods=["POST"])
+def trello_connect_endpoint():
+    """Verify user Trello token, save in database and .env, and initialize board."""
+    data = request.get_json(silent=True) or {}
+    token = data.get("token", "").strip()
+    if not token:
+        return jsonify({"error": "Trello token is required."}), 400
+
+    valid, res = trello_service.verify_token(token)
+    if not valid:
+        return jsonify({"error": f"Invalid Trello token: {res}"}), 400
+
+    # Save token in DB
+    db.save_trello_setting("token", token)
+
+    # Attempt to persist token to .env file
+    try:
+        env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                env_content = f.read()
+            if "TRELLO_TOKEN=" in env_content:
+                lines = []
+                for line in env_content.splitlines():
+                    if line.startswith("TRELLO_TOKEN="):
+                        lines.append(f"TRELLO_TOKEN={token}")
+                    else:
+                        lines.append(line)
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.warning(f"Could not update .env: {e}")
+
+    # Provision or connect board
+    try:
+        board_info = trello_service.get_or_create_board(token)
+    except Exception as e:
+        return jsonify({"error": f"Token is valid, but failed to setup board: {e}"}), 500
+
+    # Run initial sync in background
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+    threading.Thread(target=trello_service.sync_all, args=(user_id, is_admin), daemon=True).start()
+
+    return jsonify({
+        "message": "Connected to Trello successfully!",
+        "member": res,
+        "boardUrl": board_info.get("boardUrl"),
+        "boardName": board_info.get("boardName")
+    }), 200
+
+@app.route("/api/trello/disconnect", methods=["POST"])
+def trello_disconnect_endpoint():
+    """Disconnect Trello token and reset integration."""
+    db.save_trello_setting("token", "")
+    return jsonify({"message": "Trello disconnected successfully."}), 200
+
+@app.route("/api/trello/sync", methods=["POST"])
+def trello_sync_endpoint():
+    """Trigger bidirectional sync between CommitFlow action items and Trello cards."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+    result = trello_service.sync_all(user_id=user_id, is_admin=is_admin)
+    if not result.get("success") and not result.get("connected"):
+        return jsonify(result), 400
+    return jsonify(result), 200
+
+@app.route("/api/trello/export/<action_id>", methods=["POST"])
+def trello_export_task_endpoint(action_id):
+    """Export a single CommitFlow action item to Trello."""
+    token = trello_service.get_active_token()
+    if not token:
+        return jsonify({"error": "Trello is not connected. Please connect your token first."}), 400
+
+    # Fetch action item details
+    with db.get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT a.id, a.title, a.description, a.owner, a.deadline, a.status,
+                   a.trello_card_id, a.trello_card_url,
+                   COALESCE(t.title, 'CommitFlow Meeting') as "meeting_title"
+            FROM action_items a
+            LEFT JOIN transcripts t ON a.transcript_id = t.id
+            WHERE a.id = %s;
+        """, (action_id,))
+        item = cur.fetchone()
+
+    if not item:
+        return jsonify({"error": "Action item not found."}), 404
+
+    if item.get("status") != "Approved":
+        return jsonify({"error": "Only approved action items can be exported to project boards. Please review and approve the task first."}), 400
+
+    desc_parts = []
+    if item.get("description"):
+        desc_parts.append(item["description"])
+    if item.get("owner"):
+        desc_parts.append(f"👤 Assignee: {item['owner']}")
+    if item.get("deadline") and item["deadline"] != "Unspecified":
+        desc_parts.append(f"⏰ Deadline: {item['deadline']}")
+    if item.get("meeting_title"):
+        desc_parts.append(f"📌 Source: {item['meeting_title']}")
+    card_desc = "\n\n".join(desc_parts)
+
+    if item.get("trello_card_id"):
+        trello_service.update_card(
+            item["trello_card_id"],
+            title=item["title"],
+            description=card_desc,
+            status=item.get("status")
+        )
+        return jsonify({
+            "message": "Trello card updated.",
+            "cardId": item["trello_card_id"],
+            "cardUrl": item.get("trello_card_url")
+        }), 200
+    else:
+        card = trello_service.create_card(
+            title=item["title"],
+            description=card_desc,
+            status=item.get("status")
+        )
+        if not card:
+            return jsonify({"error": "Failed to create Trello card."}), 500
+
+        db.link_action_item_trello(action_id, card["id"], card.get("url", ""))
+        return jsonify({
+            "message": "Exported to Trello successfully!",
+            "cardId": card["id"],
+            "cardUrl": card.get("url")
+        }), 200
+
+@app.route("/api/trello/board", methods=["GET"])
+def trello_board_endpoint():
+    """Retrieve board view organized into To Do, In Progress, and Done columns."""
+    data = trello_service.get_trello_board_cards()
+    return jsonify(data), 200
+
+@app.route("/api/trello/cards", methods=["POST"])
+def trello_create_card_endpoint():
+    """Create a new task card both on Trello and in CommitFlow."""
+    data = request.get_json(silent=True) or {}
+    title = data.get("title", "").strip()
+    description = data.get("description", "").strip()
+    status = data.get("status", "Pending Approval")
+    deadline = data.get("deadline", "Unspecified")
+
+    if not title:
+        return jsonify({"error": "Title is required."}), 400
+
+    card = trello_service.create_card(title=title, description=description, status=status)
+    card_id = card["id"] if card else None
+    card_url = card.get("url") if card else None
+
+    saved = db.upsert_action_item_from_trello(
+        trello_card_id=card_id or f"cf-task-{uuid.uuid4().hex[:6]}",
+        title=title,
+        description=description,
+        status=status,
+        deadline=deadline,
+        trello_card_url=card_url
+    )
+    return jsonify({"message": "Task created successfully.", "task": saved, "trelloCard": card}), 201
+
+@app.route("/api/trello/cards/<card_id>", methods=["PUT"])
+def trello_update_card_endpoint(card_id):
+    """Update or move card status on Trello and update in CommitFlow."""
+    data = request.get_json(silent=True) or {}
+    status = data.get("status")
+    title = data.get("title")
+    description = data.get("description")
+
+    trello_service.update_card(card_id, title=title, description=description, status=status)
+
+    if status and db.get_connection_url():
+        with db.get_db_cursor(commit=True) as cur:
+            cur.execute("UPDATE action_items SET status = %s WHERE trello_card_id = %s;", (status, card_id))
+
+    return jsonify({"message": "Card updated successfully."}), 200
 
 # -------------------------------------------------------------
 # REST API Endpoints: Administrator Panel
@@ -1285,6 +1702,22 @@ def team_lead_reports():
         return jsonify({"reports": None}), 200
     reports = db.get_team_reports(team["id"])
     return jsonify({"reports": reports}), 200
+
+@app.route("/api/team-lead/follow-ups", methods=["GET"])
+@require_team_lead
+def team_lead_follow_ups():
+    """Retrieve unresolved questions and follow-ups scoped to team lead permissions."""
+    user_id = request.current_user["id"]
+    status_filter = request.args.get("status")
+    if db.get_connection_url():
+        questions = db.list_unresolved_questions(
+            user_id=user_id,
+            is_admin=False,
+            is_team_lead=True,
+            status_filter=status_filter
+        )
+        return jsonify(questions), 200
+    return jsonify([]), 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
