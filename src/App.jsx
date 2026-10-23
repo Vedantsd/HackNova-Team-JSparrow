@@ -12,6 +12,7 @@ import Dashboard from './pages/Dashboard.jsx'
 import Meetings from './pages/Meetings.jsx'
 import Settings from './pages/Settings.jsx'
 import Placeholder from './pages/Placeholder.jsx'
+import Calendar from './pages/Calendar.jsx'
 import LiveMeeting from './pages/LiveMeeting.jsx'
 import Transcripts from './pages/Transcripts.jsx'
 import MeetingAnalysis from './pages/MeetingAnalysis.jsx'
@@ -145,7 +146,8 @@ export default function App() {
         <Route path="/summaries" element={<Summaries />} />
         <Route path="/actions" element={<ActionItems />} />
         <Route path="/settings" element={<Settings />} />
-        {['calendar', 'team', 'projects', 'analytics', 'integrations'].map(p => (
+        <Route path="/calendar" element={<Calendar />} />
+        {['team', 'projects', 'analytics', 'integrations'].map(p => (
           <Route key={p} path={'/' + p} element={<Placeholder />} />
         ))}
       </Route>
