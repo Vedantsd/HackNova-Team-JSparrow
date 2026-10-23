@@ -236,21 +236,22 @@ const DEFAULT_TRANSCRIPTS = [
   }
 ]
 
-// Initialize store in localStorage if empty
+// Initialize store in localStorage if empty (No dummy demo data per HackNova strict requirements)
 function loadInitialTranscripts() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_TRANSCRIPTS)
     if (raw) {
       const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed
+      if (Array.isArray(parsed)) {
+        // Filter out any stale mock demo transcripts so only genuine user uploads appear
+        const realOnly = parsed.filter(t => t.id !== 'tx-acme-onboarding' && t.id !== 'tx-processing-demo' && t.id !== 'tx-failed-demo')
+        return realOnly
+      }
     }
   } catch (err) {
     console.error('Failed reading transcripts from storage:', err)
   }
-  try {
-    localStorage.setItem(STORAGE_KEY_TRANSCRIPTS, JSON.stringify(DEFAULT_TRANSCRIPTS))
-  } catch {}
-  return DEFAULT_TRANSCRIPTS
+  return []
 }
 
 // Helper to save transcripts

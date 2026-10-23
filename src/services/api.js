@@ -123,6 +123,66 @@ export const api = {
     return transcriptStore.editActionItem(transcriptId, actionItemId, updates)
   },
 
+  bulkApproveActionItems: async (actionIds) => {
+    return await req('/api/action-items/bulk-approve', {
+      method: 'POST',
+      body: JSON.stringify({ actionIds })
+    })
+  },
+
+  getActiveUsers: async () => {
+    try {
+      return await req('/api/users/active')
+    } catch (e) {
+      return []
+    }
+  },
+
+  getExportTasksUrl: (format = 'csv', transcriptId = null) => {
+    let url = `${BASE}/api/action-items/export?format=${format}&onlyApproved=true`
+    if (transcriptId) url += `&transcriptId=${transcriptId}`
+    return url
+  },
+
+  exportTasksJson: async (transcriptId = null) => {
+    let url = `/api/action-items/export?format=json&onlyApproved=true`
+    if (transcriptId) url += `&transcriptId=${transcriptId}`
+    return await req(url)
+  },
+
+  // Unresolved Questions & Follow-ups
+  listUnresolvedQuestions: async (status = null) => {
+    try {
+      const qs = status ? `?status=${encodeURIComponent(status)}` : ''
+      return await req(`/api/unresolved-questions${qs}`)
+    } catch (e) {
+      return []
+    }
+  },
+
+  updateUnresolvedQuestion: async (questionId, data) => {
+    return await req(`/api/unresolved-questions/${questionId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    })
+  },
+
+  createUnresolvedQuestion: async (data) => {
+    return await req('/api/unresolved-questions', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    })
+  },
+
+  getTeamLeadFollowUps: async (status = null) => {
+    try {
+      const qs = status ? `?status=${encodeURIComponent(status)}` : ''
+      return await req(`/api/team-lead/follow-ups${qs}`)
+    } catch (e) {
+      return []
+    }
+  },
+
   // -------------------------------------------------------------
   // Authentication & Session
   // -------------------------------------------------------------
@@ -260,5 +320,17 @@ export const api = {
     method: 'PUT',
     body: JSON.stringify(data)
   }),
-  getTeamLeadReports: () => req('/api/team-lead/reports')
+  getTeamLeadReports: () => req('/api/team-lead/reports'),
+
+  // -------------------------------------------------------------
+  // Trello Project Management Integration APIs
+  // -------------------------------------------------------------
+  getTrelloStatus: () => req('/api/trello/status'),
+  connectTrello: (token) => req('/api/trello/connect', { method: 'POST', body: JSON.stringify({ token }) }),
+  disconnectTrello: () => req('/api/trello/disconnect', { method: 'POST' }),
+  syncTrello: () => req('/api/trello/sync', { method: 'POST' }),
+  getTrelloBoard: () => req('/api/trello/board'),
+  exportActionItemToTrello: (actionId) => req(`/api/trello/export/${actionId}`, { method: 'POST' }),
+  createTrelloCard: (data) => req('/api/trello/cards', { method: 'POST', body: JSON.stringify(data) }),
+  updateTrelloCard: (cardId, data) => req(`/api/trello/cards/${cardId}`, { method: 'PUT', body: JSON.stringify(data) })
 }
