@@ -1180,6 +1180,70 @@ button.pill:hover {
   border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
+/* HACKNOVA'26 Classification Badges */
+.classification-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.classification-badge.commitment {
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.classification-badge.suggestion {
+  color: #a855f7;
+  background: rgba(168, 85, 247, 0.12);
+  border: 1px solid rgba(168, 85, 247, 0.3);
+}
+.classification-badge.unresolved_question,
+.classification-badge.question {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+/* HACKNOVA'26 Duplicate & Conflict Callouts */
+.duplicate-callout {
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px dashed rgba(245, 158, 11, 0.35);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-top: 6px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: #f59e0b;
+  line-height: 1.4;
+}
+.conflict-callout {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px dashed rgba(239, 68, 68, 0.35);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-top: 6px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: #ef4444;
+  line-height: 1.4;
+}
+.audit-note {
+  font-size: 11.5px;
+  color: var(--color-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 /* Toast & Error Banners */
 .toast-banner {
   display: flex;

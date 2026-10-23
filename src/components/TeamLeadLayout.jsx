@@ -15,7 +15,8 @@ import {
   Moon,
   Users,
   Menu,
-  CheckCircle2
+  CheckCircle2,
+  HelpCircle
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useTheme } from '../theme.jsx'
@@ -40,6 +41,7 @@ export default function TeamLeadLayout() {
     { to: '/team-lead/transcripts', label: 'Meeting Transcripts', icon: FileText },
     { to: '/team-lead/analysis', label: 'Decisions & Analysis', icon: Sparkles },
     { to: '/team-lead/action-items', label: 'Team Action Items', icon: CheckSquare },
+    { to: '/team-lead/follow-ups', label: 'Follow-ups & Questions', icon: HelpCircle },
     { to: '/team-lead/reports', label: 'Team Reports & Metrics', icon: BarChart3 },
     { to: '/team-lead/profile', label: 'Lead Profile', icon: User },
   ]

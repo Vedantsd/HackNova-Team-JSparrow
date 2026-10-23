@@ -1,12 +1,12 @@
 import { NavLink } from 'react-router-dom'
-import { Home, Video, CalendarDays, FileText, Sparkles, CheckSquare, Users, FolderOpen, BarChart3, Plug, ShieldCheck } from 'lucide-react'
+import { Home, Video, CalendarDays, FileText, Sparkles, CheckSquare, HelpCircle, Users, FolderOpen, BarChart3, Plug, ShieldCheck, Trello } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import Logo from './Logo.jsx'
 
 const groups = [
-  ['Overview', [['/user/dashboard', 'Dashboard', Home], ['/user/meetings', 'My Meetings', Video, 3], ['/user/calendar', 'Calendar', CalendarDays]]],
-  ['Intelligence', [['/user/transcripts', 'Transcripts', FileText], ['/user/analysis', 'Meeting Analysis', Sparkles], ['/user/action-items', 'Action Items', CheckSquare, 5]]],
-  ['Workspace', [['/user/profile', 'My Profile', Users], ['/user/projects', 'Projects', FolderOpen], ['/user/settings', 'Settings', Plug]]],
+  ['Overview', [['/user/dashboard', 'Dashboard', Home], ['/user/meetings', 'My Meetings', Video], ['/user/calendar', 'Calendar', CalendarDays]]],
+  ['Intelligence', [['/user/transcripts', 'Transcripts', FileText], ['/user/analysis', 'Meeting Analysis', Sparkles], ['/user/action-items', 'Action Items', CheckSquare], ['/user/follow-ups', 'Follow-ups & Questions', HelpCircle]]],
+  ['Workspace', [['/user/profile', 'My Profile', Users], ['/user/trello', 'Trello Board', Trello], ['/user/settings', 'Settings', Plug]]],
 ]
 
 export default function Sidebar({ open, onClose }) {

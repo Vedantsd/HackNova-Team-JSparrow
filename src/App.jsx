@@ -19,6 +19,8 @@ import Transcripts from './pages/Transcripts.jsx'
 import MeetingAnalysis from './pages/MeetingAnalysis.jsx'
 import Summaries from './pages/Summaries.jsx'
 import ActionItems from './pages/ActionItems.jsx'
+import FollowUps from './pages/FollowUps.jsx'
+import TrelloBoard from './pages/TrelloBoard.jsx'
 
 // Admin Panel Pages
 import AdminDashboard from './pages/admin/AdminDashboard.jsx'
@@ -176,9 +178,12 @@ export default function App() {
         <Route path="transcripts/:id/analysis" element={<MeetingAnalysis />} />
         <Route path="analysis" element={<Summaries />} />
         <Route path="action-items" element={<ActionItems />} />
+        <Route path="follow-ups" element={<FollowUps />} />
+        <Route path="trello" element={<TrelloBoard />} />
+        <Route path="projects" element={<TrelloBoard />} />
         <Route path="profile" element={<Settings />} />
         <Route path="settings" element={<Settings />} />
-        {['projects', 'analytics', 'integrations'].map(p => (
+        {['analytics', 'integrations'].map(p => (
           <Route key={p} path={p} element={<Placeholder />} />
         ))}
       </Route>
@@ -195,6 +200,7 @@ export default function App() {
         <Route path="transcripts" element={<TeamLeadTranscripts />} />
         <Route path="analysis" element={<TeamLeadAnalysis />} />
         <Route path="action-items" element={<TeamLeadActionItems />} />
+        <Route path="follow-ups" element={<FollowUps isTeamLead={true} />} />
         <Route path="reports" element={<TeamLeadReports />} />
         <Route path="profile" element={<TeamLeadProfile />} />
       </Route>
@@ -217,6 +223,8 @@ export default function App() {
       {/* --------------------------------------------------------- */}
       {/* Legacy Route Aliases & Redirects                         */}
       {/* --------------------------------------------------------- */}
+      <Route path="/teamlead/*" element={<Navigate to="/team-lead" replace />} />
+      <Route path="/follow-ups" element={<Navigate to="/user/follow-ups" replace />} />
       <Route path="/meetings" element={<Navigate to="/user/meetings" replace />} />
       <Route path="/calendar" element={<Navigate to="/user/calendar" replace />} />
       <Route path="/transcripts" element={<Navigate to="/user/transcripts" replace />} />
