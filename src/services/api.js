@@ -42,6 +42,9 @@ export const api = {
   // Transcripts & Meetings
   listMeetings: () => req('/api/meetings'),
   getMeeting: id => req(`/api/meetings/${id}`),
+  createMeeting: (data = {}) => req('/api/meetings', { method: 'POST', body: JSON.stringify(data) }),
+  getMeetingToken: (meetingId) => req(`/api/meetings/${meetingId}/livekit-token`, { method: 'POST' }),
+  getCalendar: (year, month) => req(`/api/calendar?year=${year}&month=${month}`),
 
   listTranscripts: async () => {
     try {
