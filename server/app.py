@@ -80,6 +80,19 @@ def require_admin(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def require_team_lead(f):
+    """Route decorator requiring active Team Lead role."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Unauthorized. Please log in to continue."}), 401
+        if user.get("role") != "team_lead":
+            return jsonify({"error": "Forbidden. Team Lead privileges required."}), 403
+        request.current_user = user
+        return f(*args, **kwargs)
+    return decorated_function
+
 # In-memory store fallback when PostgreSQL is not yet connected
 _mem_store = {
     "transcripts": {},
@@ -708,8 +721,8 @@ def admin_update_user_role(user_id):
     """Promote or demote a user role with last-active-admin safeguard."""
     data = request.get_json(silent=True) or {}
     new_role = data.get("role")
-    if not new_role:
-        return jsonify({"error": "Role is required ('user' or 'admin')."}), 400
+    if not new_role or new_role not in ('user', 'team_lead', 'admin'):
+        return jsonify({"error": "Role is required ('user', 'team_lead', or 'admin')."}), 400
     try:
         db.update_user_role(user_id, new_role, actor_admin=request.current_user)
         return jsonify({"message": f"User role updated to '{new_role}' successfully."}), 200
@@ -959,6 +972,319 @@ def serve_frontend_or_status(path):
   </div>
 </body>
 </html>""", 200
+
+# -------------------------------------------------------------
+# Admin Teams Management Endpoints (Strictly require_admin)
+# -------------------------------------------------------------
+
+@app.route("/api/admin/teams", methods=["GET"])
+@require_admin
+def admin_list_teams():
+    """Retrieve all teams with assigned leads, member count, and meeting count."""
+    teams = db.get_teams()
+    return jsonify({"teams": teams}), 200
+
+@app.route("/api/admin/teams", methods=["POST"])
+@require_admin
+def admin_create_team():
+    """Create a new team and optionally assign a Team Lead."""
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    description = data.get("description", "").strip()
+    lead_id = data.get("leadId")
+    if not name:
+        return jsonify({"error": "Team name is required."}), 400
+    try:
+        team = db.create_team(name=name, description=description, lead_id=lead_id)
+        db.log_audit_event(
+            request.current_user["id"],
+            request.current_user["email"],
+            "TEAM_CREATED",
+            {"teamId": team["id"], "teamName": name, "leadId": lead_id},
+            request.remote_addr
+        )
+        return jsonify({"message": "Team created successfully.", "team": team}), 201
+    except Exception as e:
+        logger.error(f"Error creating team: {e}")
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/admin/teams/<team_id>", methods=["PUT"])
+@require_admin
+def admin_update_team(team_id):
+    """Update team details and reassign lead."""
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    description = data.get("description", "").strip()
+    lead_id = data.get("leadId")
+    if not name:
+        return jsonify({"error": "Team name is required."}), 400
+    try:
+        team = db.update_team(team_id, name=name, description=description, lead_id=lead_id)
+        db.log_audit_event(
+            request.current_user["id"],
+            request.current_user["email"],
+            "TEAM_UPDATED",
+            {"teamId": team_id, "teamName": name, "leadId": lead_id},
+            request.remote_addr
+        )
+        return jsonify({"message": "Team updated successfully.", "team": team}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/admin/teams/<team_id>", methods=["DELETE"])
+@require_admin
+def admin_delete_team(team_id):
+    """Delete a team."""
+    try:
+        ok = db.delete_team(team_id)
+        if not ok:
+            return jsonify({"error": "Team not found."}), 404
+        db.log_audit_event(
+            request.current_user["id"],
+            request.current_user["email"],
+            "TEAM_DELETED",
+            {"teamId": team_id},
+            request.remote_addr
+        )
+        return jsonify({"message": "Team deleted successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/admin/teams/<team_id>/members", methods=["GET"])
+@require_admin
+def admin_get_team_members(team_id):
+    """List members belonging to a team."""
+    members = db.get_team_members(team_id)
+    return jsonify({"members": members}), 200
+
+@app.route("/api/admin/teams/<team_id>/members", methods=["POST"])
+@require_admin
+def admin_add_team_member(team_id):
+    """Add a member to a team."""
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("userId")
+    role = data.get("role", "member")
+    if not user_id:
+        return jsonify({"error": "User ID is required."}), 400
+    try:
+        db.add_team_member(team_id, user_id, role=role)
+        return jsonify({"message": "Member added to team successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/admin/teams/<team_id>/members/<user_id>", methods=["DELETE"])
+@require_admin
+def admin_remove_team_member(team_id, user_id):
+    """Remove a member from a team."""
+    try:
+        db.remove_team_member(team_id, user_id)
+        return jsonify({"message": "Member removed from team."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/admin/eligible-leads", methods=["GET"])
+@require_admin
+def admin_eligible_leads():
+    """Retrieve users eligible to be assigned as team leads."""
+    leads = db.get_eligible_team_leads()
+    return jsonify({"leads": leads}), 200
+
+# -------------------------------------------------------------
+# Team Lead Dedicated Endpoints (Strictly require_team_lead)
+# -------------------------------------------------------------
+
+@app.route("/api/team-lead/dashboard", methods=["GET"])
+@require_team_lead
+def team_lead_dashboard():
+    """Retrieve authorized team overview, member counts, upcoming meetings, and action items."""
+    user_id = request.current_user["id"]
+    data = db.get_team_lead_stats(user_id)
+    return jsonify(data), 200
+
+@app.route("/api/team-lead/team", methods=["GET"])
+@require_team_lead
+def team_lead_team_details():
+    """Retrieve Team Lead's assigned team details and real member list with metrics."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"hasTeam": False, "team": None, "members": []}), 200
+    members = db.get_team_members(team["id"])
+    return jsonify({"hasTeam": True, "team": team, "members": members}), 200
+
+@app.route("/api/team-lead/team/members", methods=["POST"])
+@require_team_lead
+def team_lead_add_member():
+    """Add a registered user to the Team Lead's authorized team."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"error": "No assigned team found for this Team Lead."}), 404
+    data = request.get_json(silent=True) or {}
+    target_user_id = data.get("userId")
+    if not target_user_id:
+        return jsonify({"error": "User ID is required."}), 400
+    try:
+        db.add_team_member(team["id"], target_user_id, role="member")
+        return jsonify({"message": "Member added to team successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/team-lead/team/members/<target_user_id>", methods=["DELETE"])
+@require_team_lead
+def team_lead_remove_member(target_user_id):
+    """Remove a member from the Team Lead's authorized team."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"error": "No assigned team found for this Team Lead."}), 404
+    try:
+        db.remove_team_member(team["id"], target_user_id)
+        return jsonify({"message": "Member removed from team."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/team-lead/available-users", methods=["GET"])
+@require_team_lead
+def team_lead_available_users():
+    """Retrieve registered users who are not yet members of this team."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"users": []}), 200
+    users = db.get_available_users_for_team(team["id"])
+    return jsonify({"users": users}), 200
+
+@app.route("/api/team-lead/meetings", methods=["GET"])
+@require_team_lead
+def team_lead_meetings():
+    """Retrieve meetings belonging to Team Lead's team."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"meetings": []}), 200
+    limit = min(int(request.args.get("limit", 50)), 100)
+    offset = int(request.args.get("offset", 0))
+    meetings = db.get_team_meetings(team["id"], limit=limit, offset=offset)
+    return jsonify({"meetings": meetings}), 200
+
+@app.route("/api/team-lead/meetings", methods=["POST"])
+@require_team_lead
+def team_lead_create_meeting():
+    """Create and schedule a meeting for this team using real team members."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"error": "No team assigned."}), 404
+    data = request.get_json(silent=True) or {}
+    title = data.get("title", "").strip()
+    scheduled_at = data.get("scheduledAt")
+    duration = data.get("duration", "30 min")
+    participant_ids = data.get("participantIds", [])
+    if not title:
+        return jsonify({"error": "Meeting title is required."}), 400
+    try:
+        meeting = db.create_team_meeting(
+            title=title,
+            host_id=user_id,
+            team_id=team["id"],
+            scheduled_at=scheduled_at,
+            duration=duration,
+            participant_ids=participant_ids
+        )
+        return jsonify({"message": "Team meeting scheduled successfully.", "meeting": meeting}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/team-lead/calendar", methods=["GET"])
+@require_team_lead
+def team_lead_calendar():
+    """Retrieve calendar meetings for Team Lead."""
+    user_id = request.current_user["id"]
+    now = datetime.now(timezone.utc)
+    try:
+        year = int(request.args.get("year", now.year))
+        month = int(request.args.get("month", now.month))
+    except (ValueError, TypeError):
+        year = now.year
+        month = now.month
+    meetings = db.get_calendar_meetings(user_id=user_id, year=year, month=month, is_admin=False)
+    return jsonify({"year": year, "month": month, "meetings": meetings}), 200
+
+@app.route("/api/team-lead/transcripts", methods=["GET"])
+@require_team_lead
+def team_lead_transcripts():
+    """Retrieve meeting transcripts and summaries for Team Lead's team."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"transcripts": []}), 200
+    transcripts = db.get_team_transcripts(team["id"])
+    return jsonify({"transcripts": transcripts}), 200
+
+@app.route("/api/team-lead/transcripts/<transcript_id>/analysis", methods=["GET"])
+@require_team_lead
+def team_lead_analysis(transcript_id):
+    """Retrieve AI analysis, decisions, and questions for team meeting transcript."""
+    meeting = db.get_transcript_by_id(transcript_id, is_admin=False)
+    if not meeting:
+        meeting = db.get_transcript_by_id(transcript_id, is_admin=True)
+    if not meeting:
+        return jsonify({"error": "Meeting analysis not found."}), 404
+    return jsonify(meeting), 200
+
+@app.route("/api/team-lead/action-items", methods=["GET"])
+@require_team_lead
+def team_lead_action_items():
+    """Retrieve action items for this team's meetings with assigned member details."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"actionItems": []}), 200
+    items = db.get_team_action_items(team["id"])
+    return jsonify({"actionItems": items}), 200
+
+@app.route("/api/team-lead/action-items/<action_id>/assign", methods=["PUT"])
+@require_team_lead
+def team_lead_assign_action(action_id):
+    """Assign an action item to a valid team member."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"error": "No assigned team found."}), 404
+    data = request.get_json(silent=True) or {}
+    assignee_id = data.get("assigneeId")
+    if not assignee_id:
+        return jsonify({"error": "Assignee user ID is required."}), 400
+    try:
+        db.assign_team_action_item(action_id, assignee_id, team_id=team["id"])
+        return jsonify({"message": "Action item assigned successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/team-lead/action-items/<action_id>", methods=["PUT"])
+@require_team_lead
+def team_lead_update_action(action_id):
+    """Update task status or deadline for a team action item."""
+    data = request.get_json(silent=True) or {}
+    status = data.get("status")
+    deadline = data.get("deadline")
+    try:
+        db.update_team_action_item(action_id, status=status, deadline=deadline)
+        return jsonify({"message": "Action item updated successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/team-lead/reports", methods=["GET"])
+@require_team_lead
+def team_lead_reports():
+    """Retrieve team meeting, attendance, and action item metrics."""
+    user_id = request.current_user["id"]
+    team = db.get_team_by_lead_id(user_id)
+    if not team:
+        return jsonify({"reports": None}), 200
+    reports = db.get_team_reports(team["id"])
+    return jsonify({"reports": reports}), 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
