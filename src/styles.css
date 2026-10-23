@@ -953,7 +953,7 @@ button.pill:hover {
     -webkit-backdrop-filter: blur(8px);
   }
 
-  .input-field, .dropzone, .transcript-bubble {
+  .input-field, .dropzone, .transcript-bubble, .analysis-tabs-bar, .toast-banner, .evidence-box {
     background: var(--color-soft-glass);
     backdrop-filter: blur(var(--glass-blur-sm));
     -webkit-backdrop-filter: blur(var(--glass-blur-sm));
@@ -1033,6 +1033,199 @@ button.pill:hover {
 
 .transcript-entry:hover .transcript-bubble {
   border-color: var(--color-border-hover);
+}
+
+/* Status Badges */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 99px;
+  border: 1px solid var(--color-border);
+  background: var(--color-soft);
+  color: var(--color-text);
+  white-space: nowrap;
+}
+
+.status-badge.processed, .status-badge.approved {
+  background: rgba(22, 163, 74, 0.12);
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.25);
+}
+
+.status-badge.processing {
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--color-primary);
+  border-color: rgba(99, 102, 241, 0.25);
+}
+
+.status-badge.uploaded, .status-badge.pending-approval {
+  background: rgba(217, 119, 6, 0.12);
+  color: #d97706;
+  border-color: rgba(217, 119, 6, 0.25);
+}
+
+.status-badge.failed, .status-badge.rejected {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--color-danger);
+  border-color: rgba(239, 68, 68, 0.25);
+}
+
+/* Meeting Analysis Tab Navigation */
+.analysis-tabs-bar {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--color-border);
+  overflow-x: auto;
+  background: var(--color-soft);
+}
+
+.analysis-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: none;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 180ms ease;
+}
+
+.analysis-tab-btn:hover {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border-color: var(--color-border);
+}
+
+.analysis-tab-btn.active {
+  background: var(--color-surface);
+  color: var(--color-primary);
+  border-color: var(--color-border);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.tab-pill-count {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: var(--color-soft);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+
+.analysis-tab-btn.active .tab-pill-count {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: transparent;
+}
+
+/* Evidence Box */
+.evidence-box {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  font-size: 12.5px;
+  margin-top: 6px;
+}
+
+.evidence-speaker {
+  font-weight: 600;
+  color: var(--color-primary);
+  margin-right: 4px;
+}
+
+.evidence-quote {
+  font-style: italic;
+  color: var(--color-text);
+}
+
+/* Ambiguity & Metadata Flags */
+.warning-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #d97706;
+  background: rgba(217, 119, 6, 0.1);
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(217, 119, 6, 0.25);
+}
+
+.confirmed-meta {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.danger-tag {
+  color: var(--color-danger);
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+/* Toast & Error Banners */
+.toast-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  background: rgba(22, 163, 74, 0.12);
+  border: 1px solid rgba(22, 163, 74, 0.28);
+  border-radius: 12px;
+  color: #16a34a;
+  font-weight: 500;
+  box-shadow: var(--shadow-sm);
+  animation: slideDown 200ms ease;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  color: var(--color-danger);
+  font-size: 12.5px;
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.discussion-points-list {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
 }
 
 @media (max-width: 1100px) {
