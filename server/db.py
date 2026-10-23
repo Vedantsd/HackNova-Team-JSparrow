@@ -62,16 +62,30 @@ def get_db_cursor(commit=False):
         raise ConnectionError("Database not configured or connection failed.")
 
     conn = _db_pool.getconn()
+    if getattr(conn, 'closed', 0) != 0:
+        try:
+            _db_pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = _db_pool.getconn()
+
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         yield cursor
         if commit:
             conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            if getattr(conn, 'closed', 0) == 0:
+                conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        _db_pool.putconn(conn)
+        try:
+            _db_pool.putconn(conn, close=bool(getattr(conn, 'closed', 0) != 0))
+        except Exception:
+            pass
 
 def check_connection():
     """Verify database connectivity."""
@@ -135,6 +149,28 @@ def init_schema():
         key VARCHAR(64) PRIMARY KEY,
         value JSONB NOT NULL,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 0.4 Meetings Table (LiveKit room mapping & lifecycle)
+    CREATE TABLE IF NOT EXISTS meetings (
+        id VARCHAR(64) PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        room_name VARCHAR(128) NOT NULL UNIQUE,
+        host_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'live',
+        is_private BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 0.5 Meeting Participants Table
+    CREATE TABLE IF NOT EXISTS meeting_participants (
+        id SERIAL PRIMARY KEY,
+        meeting_id VARCHAR(64) REFERENCES meetings(id) ON DELETE CASCADE,
+        user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+        role VARCHAR(32) NOT NULL DEFAULT 'participant',
+        joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(meeting_id, user_id)
     );
 
     -- 1. Transcripts Table
@@ -225,6 +261,11 @@ def init_schema():
     CREATE INDEX IF NOT EXISTS idx_action_items_transcript ON action_items(transcript_id);
     CREATE INDEX IF NOT EXISTS idx_decisions_transcript ON decisions(transcript_id);
     CREATE INDEX IF NOT EXISTS idx_unresolved_transcript ON unresolved_questions(transcript_id);
+    CREATE INDEX IF NOT EXISTS idx_meetings_room ON meetings(room_name);
+    CREATE INDEX IF NOT EXISTS idx_meetings_host ON meetings(host_id);
+    CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);
+    CREATE INDEX IF NOT EXISTS idx_meeting_participants_meeting ON meeting_participants(meeting_id);
+    CREATE INDEX IF NOT EXISTS idx_meeting_participants_user ON meeting_participants(user_id);
     """
 
     try:
@@ -233,6 +274,7 @@ def init_schema():
             logger.info("Neon PostgreSQL schema initialized successfully.")
         
         seed_default_data_if_empty()
+        seed_default_meetings()
         bootstrap_admin_from_env_if_set()
         return True
     except Exception as e:
@@ -1247,3 +1289,376 @@ def update_platform_settings(new_settings, actor_admin=None):
         """, (actor_id, actor_email, json.dumps({"updatedKeys": list(new_settings.keys())})))
 
         return True
+
+# -------------------------------------------------------------
+# Meeting & LiveKit Real-Time Sessions
+# -------------------------------------------------------------
+
+def seed_default_meetings():
+    """Seed initial demonstration meetings and calendar schedule."""
+    if not get_connection_url():
+        return
+    try:
+        with get_db_cursor(commit=True) as cur:
+            # Ensure columns exist
+            cur.execute("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE;")
+            cur.execute("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS duration VARCHAR(64);")
+            cur.execute("ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS attended BOOLEAN;")
+
+            demo_meetings = [
+                ("q4-strategy", "Q4 Product Strategy Review", "cf-room-q4-strategy", "live", False, "2026-10-23 10:00:00+00", "45 min"),
+                ("eng-sprint", "Engineering Sprint Planning", "cf-room-eng-sprint", "done", False, "2026-10-22 14:30:00+00", "1h 15min"),
+                ("client-acme", "Client Onboarding - Acme Corp", "cf-room-client-acme", "done", False, "2026-10-22 10:00:00+00", "52 min"),
+                ("weekly-standup", "Weekly Team Standup", "cf-room-weekly-standup", "done", False, "2026-10-15 09:00:00+00", "28 min"),
+                ("quarterly-budget", "Q4 Budget Alignment Call", "cf-room-quarterly-budget", "done", False, "2026-10-12 15:30:00+00", "45 min"),
+                ("vendor-audit", "Third-Party Vendor Compliance Check", "cf-room-vendor-audit", "cancelled", False, "2026-10-19 13:00:00+00", "30 min"),
+                ("design-review", "Design Review Session", "cf-room-design-review", "scheduled", False, "2026-10-26 11:00:00+00", "45 min"),
+                ("investor-update", "Investor Update Call", "cf-room-investor-update", "scheduled", False, "2026-10-28 14:00:00+00", "30 min"),
+                ("lead-sync", "1:1 with Engineering Lead", "cf-room-lead-sync", "scheduled", False, "2026-10-30 16:30:00+00", "30 min"),
+                ("mobile-app-launch", "Mobile App Launch Readiness", "cf-room-mobile-app-launch", "scheduled", False, "2026-11-04 10:00:00+00", "1h"),
+            ]
+            for m_id, title, r_name, status, is_priv, sched, dur in demo_meetings:
+                cur.execute("""
+                    INSERT INTO meetings (id, title, room_name, status, is_private, scheduled_at, duration)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        scheduled_at = COALESCE(meetings.scheduled_at, EXCLUDED.scheduled_at),
+                        duration = COALESCE(meetings.duration, EXCLUDED.duration),
+                        status = CASE WHEN meetings.status = 'live' THEN 'live' ELSE EXCLUDED.status END;
+                """, (m_id, title, r_name, status, is_priv, sched, dur))
+
+            # Seed reliable sample attendance for all active users so calendar indicators are populated
+            cur.execute("SELECT id FROM users;")
+            users = cur.fetchall()
+            for u in users:
+                u_id = u["id"]
+                # eng-sprint: attended = True
+                cur.execute("""
+                    INSERT INTO meeting_participants (meeting_id, user_id, role, joined_at, attended)
+                    VALUES ('eng-sprint', %s, 'participant', '2026-10-22 14:32:00+00', TRUE)
+                    ON CONFLICT (meeting_id, user_id) DO UPDATE SET attended = TRUE;
+                """, (u_id,))
+                # quarterly-budget: attended = False (missed)
+                cur.execute("""
+                    INSERT INTO meeting_participants (meeting_id, user_id, role, joined_at, attended)
+                    VALUES ('quarterly-budget', %s, 'participant', NULL, FALSE)
+                    ON CONFLICT (meeting_id, user_id) DO UPDATE SET attended = FALSE, joined_at = NULL;
+                """, (u_id,))
+                # weekly-standup: attended = True
+                cur.execute("""
+                    INSERT INTO meeting_participants (meeting_id, user_id, role, joined_at, attended)
+                    VALUES ('weekly-standup', %s, 'participant', '2026-10-15 09:02:00+00', TRUE)
+                    ON CONFLICT (meeting_id, user_id) DO UPDATE SET attended = TRUE;
+                """, (u_id,))
+                # Note: client-acme is intentionally omitted from meeting_participants for this user to test 'Attendance unknown'
+            logger.info("Demo meetings and calendar schedule seeded successfully.")
+    except Exception as e:
+        logger.warning(f"Error seeding demo meetings: {e}")
+
+def create_meeting(title, host_id=None, is_private=False, meeting_id=None, room_name=None):
+    """
+    Create a new meeting record in Neon PostgreSQL.
+    Assigns a stable, unique room_name for LiveKit.
+    """
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+
+    m_id = meeting_id or f"m-{uuid.uuid4().hex[:8]}"
+    r_name = room_name or f"cf-room-{m_id}"
+
+    with get_db_cursor(commit=True) as cur:
+        # Check if meeting_id already exists to prevent duplicate insertion
+        cur.execute("SELECT id, title, room_name, host_id, status, is_private, created_at FROM meetings WHERE id = %s;", (m_id,))
+        existing = cur.fetchone()
+        if existing:
+            return dict(existing)
+
+        cur.execute("""
+            INSERT INTO meetings (id, title, room_name, host_id, status, is_private)
+            VALUES (%s, %s, %s, %s, 'live', %s)
+            RETURNING id, title, room_name, host_id, status, is_private, created_at;
+        """, (m_id, title, r_name, host_id, is_private))
+        meeting = dict(cur.fetchone())
+
+        # If host is assigned, register in participants
+        if host_id:
+            cur.execute("""
+                INSERT INTO meeting_participants (meeting_id, user_id, role)
+                VALUES (%s, %s, 'host')
+                ON CONFLICT (meeting_id, user_id) DO NOTHING;
+            """, (m_id, host_id))
+
+        return meeting
+
+def get_meeting_by_id(meeting_id):
+    """
+    Retrieve meeting metadata by meeting ID or LiveKit room name.
+    Includes host information and participant count.
+    """
+    if not get_connection_url():
+        return None
+
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
+                   m.status, m.is_private as "isPrivate",
+                   to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
+                   u.name as "hostName", u.email as "hostEmail",
+                   (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
+            FROM meetings m
+            LEFT JOIN users u ON m.host_id = u.id
+            WHERE m.id = %s OR m.room_name = %s;
+        """, (meeting_id, meeting_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+def get_or_create_meeting(meeting_id, title=None, host_id=None, is_private=False):
+    """
+    Retrieve meeting by ID, or create it if not found (used for demo IDs or direct links).
+    """
+    existing = get_meeting_by_id(meeting_id)
+    if existing:
+        return existing
+    
+    clean_title = title or f"Meeting {meeting_id}"
+    return create_meeting(clean_title, host_id=host_id, is_private=is_private, meeting_id=meeting_id)
+
+def list_meetings(user_id=None, is_admin=False):
+    """
+    Retrieve meetings accessible to the user:
+    - Admins: All meetings with participant counts
+    - Users: Public meetings + meetings created by user + meetings user is invited to
+    """
+    if not get_connection_url():
+        return []
+
+    with get_db_cursor(commit=False) as cur:
+        if is_admin:
+            cur.execute("""
+                SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
+                       m.status, m.is_private as "isPrivate",
+                       to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
+                       u.name as "hostName", u.email as "hostEmail",
+                       (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
+                FROM meetings m
+                LEFT JOIN users u ON m.host_id = u.id
+                ORDER BY m.created_at DESC;
+            """)
+        elif user_id:
+            cur.execute("""
+                SELECT DISTINCT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
+                       m.status, m.is_private as "isPrivate",
+                       to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
+                       u.name as "hostName", u.email as "hostEmail",
+                       (SELECT COUNT(*) FROM meeting_participants mp2 WHERE mp2.meeting_id = m.id) as "participantCount"
+                FROM meetings m
+                LEFT JOIN users u ON m.host_id = u.id
+                LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id
+                WHERE m.is_private = FALSE 
+                   OR m.host_id = %s 
+                   OR mp.user_id = %s
+                ORDER BY m.created_at DESC;
+            """, (user_id, user_id))
+        else:
+            cur.execute("""
+                SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
+                       m.status, m.is_private as "isPrivate",
+                       to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
+                       u.name as "hostName",
+                       (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
+                FROM meetings m
+                LEFT JOIN users u ON m.host_id = u.id
+                WHERE m.is_private = FALSE
+                ORDER BY m.created_at DESC;
+            """)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+def can_user_access_meeting(meeting_id, user_id, is_admin=False):
+    """
+    Check if a user is permitted to obtain a LiveKit real-time token for a meeting.
+    Admins can see metadata in admin panel, but do not automatically enter private audio/video rooms without explicit invitation.
+    Returns (allowed: bool, reason: str, meeting: dict or None).
+    """
+    meeting = get_meeting_by_id(meeting_id)
+    if not meeting:
+        return False, "Meeting not found.", None
+
+    # Public meetings can be joined by any authenticated user
+    if not meeting.get("isPrivate"):
+        return True, "Access granted.", meeting
+
+    # Private meeting: user must be the host or invited participant
+    if meeting.get("hostId") and meeting["hostId"] == user_id:
+        return True, "Access granted as meeting host.", meeting
+
+    if not get_connection_url():
+        return False, "Database not connected.", None
+
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT 1 FROM meeting_participants
+            WHERE meeting_id = %s AND user_id = %s;
+        """, (meeting["id"], user_id))
+        if cur.fetchone():
+            return True, "Access granted as invited participant.", meeting
+
+    # Admin without participant invitation cannot join private meeting room video/audio
+    if is_admin:
+        return False, "Administrators cannot join private meeting audio/video without invitation.", meeting
+
+    return False, "You are not authorized to join this private meeting.", meeting
+
+def add_meeting_participant(meeting_id, user_id, role="participant"):
+    """Register participant in meeting."""
+    if not get_connection_url():
+        return False
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO meeting_participants (meeting_id, user_id, role)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (meeting_id, user_id) DO NOTHING;
+        """, (meeting_id, user_id, role))
+        return True
+
+def get_calendar_meetings(user_id=None, year=None, month=None, is_admin=False):
+    """
+    Retrieve meetings for the given month (and adjacent padding days) with attendance status
+    for the specified user.
+    Enforces meeting visibility permissions:
+    - Admin: all meetings
+    - User: public meetings + meetings user created or is participant of
+    """
+    import calendar as py_calendar
+
+    try:
+        current_dt = datetime.now(timezone.utc)
+        target_year = int(year) if year is not None else current_dt.year
+        target_month = int(month) if month is not None else current_dt.month
+        
+        if target_month < 1 or target_month > 12:
+            target_month = current_dt.month
+        if target_year < 1970 or target_year > 2100:
+            target_year = current_dt.year
+    except (ValueError, TypeError):
+        current_dt = datetime.now(timezone.utc)
+        target_year = current_dt.year
+        target_month = current_dt.month
+
+    if not get_connection_url():
+        # Fallback in-memory demo data
+        return [
+            {"id": "q4-strategy", "title": "Q4 Product Strategy Review", "date": f"{target_year:04d}-{target_month:02d}-23", "time": "10:00 AM", "status": "live", "statusLabel": "Live", "attendance": "live", "attendanceLabel": "Live Now", "duration": "45 min", "participantCount": 8, "hostName": "Alex Rivera", "isPrivate": False},
+            {"id": "eng-sprint", "title": "Engineering Sprint Planning", "date": f"{target_year:04d}-{target_month:02d}-22", "time": "02:30 PM", "status": "done", "statusLabel": "Ended", "attendance": "attended", "attendanceLabel": "Attended", "duration": "1h 15min", "participantCount": 12, "hostName": "David Chen", "isPrivate": False},
+            {"id": "client-acme", "title": "Client Onboarding - Acme Corp", "date": f"{target_year:04d}-{target_month:02d}-22", "time": "10:00 AM", "status": "done", "statusLabel": "Ended", "attendance": "unknown", "attendanceLabel": "Attendance unknown", "duration": "52 min", "participantCount": 5, "hostName": "Rachel Green", "isPrivate": False},
+            {"id": "weekly-standup", "title": "Weekly Team Standup", "date": f"{target_year:04d}-{target_month:02d}-15", "time": "09:00 AM", "status": "done", "statusLabel": "Ended", "attendance": "attended", "attendanceLabel": "Attended", "duration": "28 min", "participantCount": 15, "hostName": "Sarah Nguyen", "isPrivate": False},
+            {"id": "quarterly-budget", "title": "Q4 Budget Alignment Call", "date": f"{target_year:04d}-{target_month:02d}-12", "time": "03:30 PM", "status": "done", "statusLabel": "Ended", "attendance": "missed", "attendanceLabel": "Missed", "duration": "45 min", "participantCount": 6, "hostName": "Elena Rostova", "isPrivate": False},
+            {"id": "vendor-audit", "title": "Third-Party Vendor Compliance Check", "date": f"{target_year:04d}-{target_month:02d}-19", "time": "01:00 PM", "status": "cancelled", "statusLabel": "Cancelled", "attendance": "cancelled", "attendanceLabel": "Cancelled", "duration": "30 min", "participantCount": 4, "hostName": "Security Officer", "isPrivate": False},
+            {"id": "design-review", "title": "Design Review Session", "date": f"{target_year:04d}-{target_month:02d}-26", "time": "11:00 AM", "status": "scheduled", "statusLabel": "Upcoming", "attendance": "none", "attendanceLabel": "Scheduled", "duration": "45 min", "participantCount": 6, "hostName": "Maria Kim", "isPrivate": False},
+            {"id": "investor-update", "title": "Investor Update Call", "date": f"{target_year:04d}-{target_month:02d}-28", "time": "02:00 PM", "status": "scheduled", "statusLabel": "Upcoming", "attendance": "none", "attendanceLabel": "Scheduled", "duration": "30 min", "participantCount": 4, "hostName": "Alex Rivera", "isPrivate": False},
+            {"id": "lead-sync", "title": "1:1 with Engineering Lead", "date": f"{target_year:04d}-{target_month:02d}-30", "time": "04:30 PM", "status": "scheduled", "statusLabel": "Upcoming", "attendance": "none", "attendanceLabel": "Scheduled", "duration": "30 min", "participantCount": 2, "hostName": "James Chen", "isPrivate": False}
+        ]
+
+    _, last_day = py_calendar.monthrange(target_year, target_month)
+    start_date = f"{target_year:04d}-{target_month:02d}-01"
+    end_date = f"{target_year:04d}-{target_month:02d}-{last_day:02d}"
+
+    with get_db_cursor(commit=False) as cur:
+        query = """
+            SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
+                   m.status, m.is_private as "isPrivate",
+                   m.duration,
+                   COALESCE(m.scheduled_at, m.created_at) as "eventTimestamp",
+                   to_char(COALESCE(m.scheduled_at, m.created_at), 'YYYY-MM-DD') as "date",
+                   to_char(COALESCE(m.scheduled_at, m.created_at), 'HH12:MI AM') as "time",
+                   u.name as "hostName", u.email as "hostEmail",
+                   (SELECT COUNT(*) FROM meeting_participants mp_cnt WHERE mp_cnt.meeting_id = m.id) as "participantCount",
+                   mp_user.attended as "userAttended",
+                   mp_user.joined_at as "userJoinedAt",
+                   mp_user.role as "userRole"
+            FROM meetings m
+            LEFT JOIN users u ON m.host_id = u.id
+            LEFT JOIN meeting_participants mp_user ON (mp_user.meeting_id = m.id AND mp_user.user_id = %s)
+            WHERE (
+                COALESCE(m.scheduled_at, m.created_at) >= (%s::date - INTERVAL '7 days')
+                AND COALESCE(m.scheduled_at, m.created_at) <= (%s::date + INTERVAL '7 days')
+            )
+        """
+        params = [user_id, start_date, end_date]
+
+        if not is_admin:
+            if user_id:
+                query += """
+                    AND (
+                        m.is_private = FALSE
+                        OR m.host_id = %s
+                        OR mp_user.user_id IS NOT NULL
+                    )
+                """
+                params.append(user_id)
+            else:
+                query += " AND m.is_private = FALSE"
+
+        query += " ORDER BY COALESCE(m.scheduled_at, m.created_at) ASC;"
+
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+
+        results = []
+        for r in rows:
+            m = dict(r)
+            m_status = (m.get("status") or "scheduled").lower()
+            
+            # Attendance determination according to requirements:
+            # - If user joined or attended the meeting according to recorded data: show Attended
+            # - If the meeting ended and user was expected to attend but did not: show Missed
+            # - If no reliable attendance record or no way to determine: show Attendance unknown
+            # - Upcoming meetings: Upcoming or Scheduled
+            # - Cancelled: Cancelled
+            if m_status == "cancelled":
+                attendance = "cancelled"
+                attendance_label = "Cancelled"
+                status_label = "Cancelled"
+            elif m_status in ("scheduled", "upcoming"):
+                attendance = "none"
+                attendance_label = "Scheduled"
+                status_label = "Upcoming"
+            elif m_status == "live":
+                attendance = "live"
+                attendance_label = "Live Now"
+                status_label = "Live"
+            else:
+                # Ended meeting ('done' or 'ended')
+                status_label = "Ended"
+                if m.get("userAttended") is True or m.get("userJoinedAt") is not None:
+                    attendance = "attended"
+                    attendance_label = "Attended"
+                elif m.get("userAttended") is False or (m.get("userJoinedAt") is None and m.get("userRole") is not None):
+                    attendance = "missed"
+                    attendance_label = "Missed"
+                else:
+                    attendance = "unknown"
+                    attendance_label = "Attendance unknown"
+
+            results.append({
+                "id": m["id"],
+                "title": m["title"],
+                "roomName": m.get("roomName"),
+                "date": m.get("date"),
+                "time": m.get("time") or "TBD",
+                "scheduledAt": m["eventTimestamp"].isoformat() if m.get("eventTimestamp") else None,
+                "status": m_status,
+                "statusLabel": status_label,
+                "duration": m.get("duration") or "30 min",
+                "participantCount": m.get("participantCount") or 0,
+                "hostName": m.get("hostName") or "Host",
+                "isPrivate": bool(m.get("isPrivate", False)),
+                "attendance": attendance,
+                "attendanceLabel": attendance_label
+            })
+
+        return results
+
+
