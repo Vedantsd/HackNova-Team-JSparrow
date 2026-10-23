@@ -16,9 +16,11 @@ from dotenv import load_dotenv
 try:
     import db
     import ai
+    import livekit_service
 except ImportError:
     from server import db
     from server import ai
+    from server import livekit_service
 
 load_dotenv()
 
@@ -250,10 +252,11 @@ def auth_me():
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
-    """Health check endpoint reporting Neon database and Gemini AI status."""
+    """Health check endpoint reporting Neon database, Gemini AI, and LiveKit Cloud status."""
     db_ok, db_msg = db.check_connection()
     ai_ok, ai_msg = ai.check_gemini_status()
     _, model_name = ai.get_gemini_config()
+    lk_ok, lk_msg = livekit_service.check_livekit_status()
 
     return jsonify({
         "status": "ok",
@@ -267,7 +270,174 @@ def health_check():
             "configured": ai_ok,
             "model": model_name,
             "message": ai_msg
+        },
+        "livekit": {
+            "configured": lk_ok,
+            "message": lk_msg
         }
+    }), 200
+
+# -------------------------------------------------------------
+# REST API Endpoints: Meetings & LiveKit Real-Time Sessions
+# -------------------------------------------------------------
+
+@app.route("/api/meetings", methods=["GET"])
+def list_meetings_endpoint():
+    """List accessible meetings for current user or admin."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+
+    meetings = db.list_meetings(user_id=user_id, is_admin=is_admin)
+    return jsonify(meetings), 200
+
+@app.route("/api/meetings/<meeting_id>", methods=["GET"])
+def get_meeting_endpoint(meeting_id):
+    """Retrieve metadata for a specific meeting."""
+    user = get_current_user()
+    meeting = db.get_meeting_by_id(meeting_id)
+    if not meeting:
+        return jsonify({"error": f"Meeting '{meeting_id}' not found."}), 404
+
+    # If meeting is private, check access
+    if meeting.get("isPrivate"):
+        if not user:
+            return jsonify({"error": "Unauthorized. Please log in to access this private meeting."}), 401
+        allowed, reason, _ = db.can_user_access_meeting(meeting_id, user["id"], is_admin=(user.get("role") == "admin"))
+        if not allowed:
+            return jsonify({"error": reason}), 403
+
+    return jsonify(meeting), 200
+
+@app.route("/api/meetings", methods=["POST"])
+@require_auth
+def create_meeting_endpoint():
+    """Create a new real-time meeting record in Neon PostgreSQL."""
+    data = request.get_json(silent=True) or {}
+    title = data.get("title", "").strip() or f"{request.current_user.get('name', 'User')}'s Meeting Room"
+    is_private = bool(data.get("isPrivate", False))
+    meeting_id = data.get("meetingId", "").strip() or None
+
+    try:
+        meeting = db.create_meeting(
+            title=title,
+            host_id=request.current_user["id"],
+            is_private=is_private,
+            meeting_id=meeting_id
+        )
+        db.log_audit_event(
+            request.current_user["id"],
+            request.current_user["email"],
+            "MEETING_CREATED",
+            {"meetingId": meeting["id"], "title": meeting["title"], "isPrivate": is_private},
+            request.remote_addr
+        )
+        return jsonify(meeting), 201
+    except Exception as e:
+        logger.error(f"Error creating meeting: {e}")
+        return jsonify({"error": "Failed to create meeting."}), 500
+
+@app.route("/api/meetings/<meeting_id>/livekit-token", methods=["POST"])
+@require_auth
+def generate_livekit_token_endpoint(meeting_id):
+    """
+    Generate a cryptographically signed LiveKit AccessToken for real-time video/audio.
+    Validates meeting existence and user permissions server-side.
+    Returns only { serverUrl, token, roomName }. Never exposes credentials.
+    """
+    user = request.current_user
+    is_admin = (user.get("role") == "admin")
+
+    # 1. Validate LiveKit server configuration
+    lk_ok, lk_msg = livekit_service.check_livekit_status()
+    if not lk_ok:
+        logger.error(f"LiveKit configuration check failed: {lk_msg}")
+        return jsonify({
+            "error": "LiveKit video conferencing is unavailable. Server configuration is missing or invalid."
+        }), 503
+
+    # 2. Check or auto-provision meeting record
+    meeting = db.get_meeting_by_id(meeting_id)
+    if not meeting:
+        if meeting_id == "new":
+            meeting = db.create_meeting(
+                title=f"{user.get('name', 'User')}'s Meeting",
+                host_id=user["id"],
+                is_private=False
+            )
+        else:
+            return jsonify({"error": f"Meeting '{meeting_id}' not found."}), 404
+
+    # 3. Verify user authorization to join this meeting
+    allowed, reason, verified_meeting = db.can_user_access_meeting(meeting["id"], user["id"], is_admin=is_admin)
+    if not allowed:
+        db.log_audit_event(
+            user["id"],
+            user["email"],
+            "LIVEKIT_JOIN_DENIED",
+            {"meetingId": meeting["id"], "reason": reason},
+            request.remote_addr
+        )
+        return jsonify({"error": reason}), 403
+
+    # 4. Generate participant token with least necessary privileges
+    try:
+        room_name = verified_meeting.get("roomName") or f"cf-room-{verified_meeting['id']}"
+        token_data = livekit_service.generate_meeting_token(
+            meeting_id=verified_meeting["id"],
+            room_name=room_name,
+            user_id=user["id"],
+            user_name=user.get("name") or f"User-{user['id'][:6]}",
+            user_role=user.get("role", "user")
+        )
+
+        # Register participant in DB
+        db.add_meeting_participant(verified_meeting["id"], user["id"])
+
+        # Audit log token issuance
+        db.log_audit_event(
+            user["id"],
+            user["email"],
+            "LIVEKIT_TOKEN_ISSUED",
+            {"meetingId": verified_meeting["id"], "roomName": room_name},
+            request.remote_addr
+        )
+
+        return jsonify(token_data), 200
+
+    except Exception as e:
+        logger.error(f"Error generating LiveKit token for meeting '{meeting_id}': {e}")
+@app.route("/api/calendar", methods=["GET"])
+def get_calendar_endpoint():
+    """
+    Retrieve calendar meetings for the requested year and month.
+    Enforces user access permissions and computes attendance statuses.
+    """
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    is_admin = (user.get("role") == "admin") if user else False
+
+    try:
+        now = datetime.now(timezone.utc)
+        year_val = request.args.get("year")
+        month_val = request.args.get("month")
+        year = int(year_val) if year_val else now.year
+        month = int(month_val) if month_val else now.month
+    except (ValueError, TypeError):
+        now = datetime.now(timezone.utc)
+        year = now.year
+        month = now.month
+
+    if month < 1 or month > 12:
+        return jsonify({"error": "Month must be between 1 and 12."}), 400
+    if year < 1970 or year > 2100:
+        return jsonify({"error": "Year must be between 1970 and 2100."}), 400
+
+    meetings = db.get_calendar_meetings(user_id=user_id, year=year, month=month, is_admin=is_admin)
+    return jsonify({
+        "year": year,
+        "month": month,
+        "meetings": meetings
     }), 200
 
 @app.route("/api/transcripts", methods=["GET"])
@@ -595,10 +765,11 @@ def admin_system_health():
     db_ok, db_msg = db.check_connection()
     ai_ok, ai_msg = ai.check_gemini_status()
     _, model_name = ai.get_gemini_config()
+    lk_ok, lk_msg = livekit_service.check_livekit_status()
     stats = db.get_admin_stats() or {}
 
     return jsonify({
-        "status": "healthy" if db_ok and ai_ok else "degraded",
+        "status": "healthy" if db_ok and ai_ok and lk_ok else "degraded",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "database": {
             "status": "connected" if db_ok else "error",
@@ -611,6 +782,10 @@ def admin_system_health():
             "model": model_name,
             "provider": "Google Gemini",
             "message": ai_msg
+        },
+        "livekit": {
+            "status": "configured" if lk_ok else "unconfigured",
+            "message": lk_msg
         },
         "system": {
             "pythonVersion": platform.python_version(),
