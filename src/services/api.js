@@ -5,11 +5,23 @@ import { transcriptStore } from './transcriptStore.js'
 const BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function req(path, opts = {}) {
+  const token = localStorage.getItem('cf_token')
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+    ...(opts.headers || {})
+  }
+
   const r = await fetch(BASE + path, { 
-    headers: { 'Content-Type': 'application/json' }, 
-    ...opts 
+    credentials: 'include',
+    ...opts,
+    headers
   })
-  if (!r.ok) throw new Error(`Request failed: ${r.status}`)
+
+  if (!r.ok) {
+    const errData = await r.json().catch(() => ({}))
+    throw new Error(errData.error || errData.message || `Request failed with status ${r.status}`)
+  }
   return r.json()
 }
 
@@ -106,5 +118,102 @@ export const api = {
       if (res) return true
     } catch (e) {}
     return transcriptStore.editActionItem(transcriptId, actionItemId, updates)
+  },
+
+  // -------------------------------------------------------------
+  // Authentication & Session
+  // -------------------------------------------------------------
+  login: async (email, password) => {
+    return await req('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password })
+    })
+  },
+
+  register: async ({ name, email, password, confirmPassword }) => {
+    return await req('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ name, email, password, confirmPassword })
+    })
+  },
+
+  logout: async () => {
+    try {
+      return await req('/api/auth/logout', { method: 'POST' })
+    } catch {
+      return { message: 'Logged out' }
+    }
+  },
+
+  getMe: async () => {
+    return await req('/api/auth/me')
+  },
+
+  // -------------------------------------------------------------
+  // Admin Panel APIs
+  // -------------------------------------------------------------
+  getAdminStats: async () => {
+    return await req('/api/admin/stats')
+  },
+
+  getAdminUsers: async (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.search) q.set('search', params.search)
+    if (params.role) q.set('role', params.role)
+    if (params.status) q.set('status', params.status)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return await req('/api/admin/users' + (qs ? `?${qs}` : ''))
+  },
+
+  updateUserStatus: async (userId, status) => {
+    return await req(`/api/admin/users/${userId}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ status })
+    })
+  },
+
+  updateUserRole: async (userId, role) => {
+    return await req(`/api/admin/users/${userId}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role })
+    })
+  },
+
+  getAdminMeetings: async (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return await req('/api/admin/meetings' + (qs ? `?${qs}` : ''))
+  },
+
+  investigateMeeting: async (meetingId) => {
+    return await req(`/api/admin/meetings/${meetingId}/investigate`)
+  },
+
+  getAdminAuditLogs: async (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.action) q.set('action', params.action)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return await req('/api/admin/audit-logs' + (qs ? `?${qs}` : ''))
+  },
+
+  getAdminSystemHealth: async () => {
+    return await req('/api/admin/system-health')
+  },
+
+  getAdminSettings: async () => {
+    return await req('/api/admin/settings')
+  },
+
+  updateAdminSettings: async (settings) => {
+    return await req('/api/admin/settings', {
+      method: 'PUT',
+      body: JSON.stringify(settings)
+    })
   }
 }
