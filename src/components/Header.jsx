@@ -235,25 +235,9 @@ export default function Header({ query, setQuery, onMenu }) {
       </div>
 
       {/* Settings */}
-      <button className="icon-btn" aria-label="Settings" onClick={() => nav('/settings')}>
+      <button className="icon-btn" aria-label="Settings" onClick={() => nav('/user/profile')}>
         <Settings size={17} />
       </button>
-
-      {/* Admin Portal (Visible strictly to authenticated Administrators) */}
-      {isAdmin && (
-        <button
-          className="btn"
-          onClick={() => nav('/admin')}
-          title="Open Admin Portal"
-          style={{
-            borderColor: 'rgba(99, 102, 241, 0.4)',
-            background: 'rgba(99, 102, 241, 0.08)'
-          }}
-        >
-          <ShieldCheck size={16} style={{ color: 'var(--color-primary)' }} />
-          <span className="hide-sm">Admin Portal</span>
-        </button>
-      )}
 
       {/* New Meeting */}
       <button className="btn primary" onClick={() => setModal(true)}>

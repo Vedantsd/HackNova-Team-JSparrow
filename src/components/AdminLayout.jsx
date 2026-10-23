@@ -16,7 +16,8 @@ import {
   Menu, 
   X,
   CheckCircle2,
-  Sparkles
+  Sparkles,
+  UsersRound
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext.jsx'
 import { useTheme } from '../theme.jsx'
@@ -36,6 +37,7 @@ export default function AdminLayout() {
   const navLinks = [
     { to: '/admin', label: 'Dashboard', icon: LayoutDashboard, end: true },
     { to: '/admin/users', label: 'User Management', icon: Users },
+    { to: '/admin/teams', label: 'Team Management', icon: UsersRound },
     { to: '/admin/meetings', label: 'Meeting Oversight', icon: Video },
     { to: '/admin/analytics', label: 'Platform Analytics', icon: BarChart3 },
     { to: '/admin/system-health', label: 'System Health', icon: Activity },
@@ -141,27 +143,6 @@ export default function AdminLayout() {
           })}
 
           <div style={{ margin: '16px 0 8px', borderTop: '1px solid var(--color-border)' }} />
-
-          {/* Link back to user dashboard */}
-          <Link
-            to="/"
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '10px',
-              padding: '9px 12px',
-              borderRadius: '10px',
-              textDecoration: 'none',
-              fontSize: '13px',
-              color: 'var(--color-muted)',
-              marginBottom: '4px',
-              transition: 'background 150ms ease, color 150ms ease'
-            }}
-            className="admin-return-link"
-          >
-            <ArrowLeft size={16} />
-            <span>Return to User Panel</span>
-          </Link>
         </nav>
 
         {/* Bottom user profile & logout */}
@@ -273,12 +254,6 @@ export default function AdminLayout() {
             >
               {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
             </button>
-
-            {/* Return to App Button */}
-            <Link to="/" className="btn" style={{ height: '34px', fontSize: '12.5px' }}>
-              <ArrowLeft size={14} />
-              <span>User Panel</span>
-            </Link>
           </div>
         </header>
 
