@@ -14,7 +14,7 @@ import {
   Quote, 
   Filter
 } from 'lucide-react'
-import { transcriptStore } from '../services/transcriptStore.js'
+import { api } from '../services/api.js'
 
 export default function ActionItems() {
   const { query = '' } = useOutletContext() || {}
@@ -25,9 +25,13 @@ export default function ActionItems() {
   const [editingId, setEditingId] = useState(null)
   const [editForm, setEditForm] = useState({ title: '', owner: '', deadline: '', priority: 'Medium' })
 
-  const loadData = () => {
-    const list = transcriptStore.getAllActionItems()
-    setItems(list)
+  const loadData = async () => {
+    try {
+      const list = await api.listActionItems()
+      setItems(list || [])
+    } catch (e) {
+      console.error('Failed to load action items:', e)
+    }
   }
 
   useEffect(() => {
@@ -41,14 +45,14 @@ export default function ActionItems() {
     }
   }, [])
 
-  const handleApprove = (transcriptId, actionId) => {
-    transcriptStore.updateActionItemStatus(transcriptId, actionId, 'Approved')
-    loadData()
+  const handleApprove = async (transcriptId, actionId) => {
+    await api.approveActionItem(transcriptId, actionId)
+    await loadData()
   }
 
-  const handleReject = (transcriptId, actionId) => {
-    transcriptStore.updateActionItemStatus(transcriptId, actionId, 'Rejected')
-    loadData()
+  const handleReject = async (transcriptId, actionId) => {
+    await api.rejectActionItem(transcriptId, actionId)
+    await loadData()
   }
 
   const startEdit = item => {
@@ -61,10 +65,10 @@ export default function ActionItems() {
     })
   }
 
-  const saveEdit = (transcriptId, actionId) => {
-    transcriptStore.editActionItem(transcriptId, actionId, editForm)
+  const saveEdit = async (transcriptId, actionId) => {
+    await api.editActionItem(transcriptId, actionId, editForm)
     setEditingId(null)
-    loadData()
+    await loadData()
   }
 
   const filteredItems = useMemo(() => {
