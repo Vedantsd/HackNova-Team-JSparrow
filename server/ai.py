@@ -40,12 +40,19 @@ class ActionItemModel(BaseModel):
     id: Optional[str] = None
     title: str = Field(..., description="Actionable task statement")
     description: str = Field(default="")
+    itemType: Literal["commitment", "suggestion", "unresolved_question"] = Field(
+        default="commitment",
+        description="Classification: 'commitment' (agreed assignment), 'suggestion' (idea floated), or 'unresolved_question'"
+    )
     owner: str = Field(default="Unassigned", description="Confirmed name or 'Unassigned'")
     ownerStatus: Literal["confirmed", "ambiguous"] = Field(default="confirmed")
     deadline: str = Field(default="Unspecified", description="ISO date YYYY-MM-DD, explicit day, or 'Unspecified'")
     deadlineStatus: Literal["confirmed", "missing"] = Field(default="confirmed")
     priority: Literal["High", "Medium", "Low"] = Field(default="Medium")
     status: Literal["Pending Approval", "Approved", "Rejected"] = Field(default="Pending Approval")
+    confidenceScore: float = Field(default=0.90, description="Confidence score from 0.0 to 1.0")
+    relatedDecision: Optional[str] = Field(default=None, description="Title of related confirmed decision, if any")
+    followUp: Optional[str] = Field(default=None, description="Follow-up notes or verification instructions")
     evidence: Optional[EvidenceModel] = None
 
 class UnresolvedQuestionModel(BaseModel):
@@ -68,7 +75,7 @@ class TranscriptAnalysisResult(BaseModel):
 
 def get_gemini_config():
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
     return api_key, model
 
 def check_gemini_status():
@@ -83,13 +90,17 @@ Analyze the following meeting transcript for "{meeting_title}".
 
 CRITICAL INSTRUCTIONS:
 1. Ground Truth Only: Never invent an owner, deadline, decision, or statement that is not explicitly supported by the transcript.
-2. Distinguish Commitments vs Suggestions: Distinguish confirmed commitments from mere suggestions, questions, or preliminary thoughts.
-3. Handle Missing Details:
-   - If an owner is not clearly identified or is vague (e.g. "someone on QA should..."), set owner="Unassigned" and ownerStatus="ambiguous".
-   - If a deadline is not stated, set deadline="Unspecified" and deadlineStatus="missing".
-4. Action Items: All newly extracted action items must have status="Pending Approval" so human operators can review them.
-5. Traceable Evidence: For each decision and action item, include the verbatim quote, speaker name, and timestamp if available in the text.
-6. Unresolved Questions: Explicitly identify missing owners, ambiguous deadlines, conflicting instructions, and unanswered questions.
+2. Strict Classification Mechanism:
+   - "commitment": A concrete deliverable or action someone explicitly agreed or was assigned to perform (e.g. "Swapnil will implement notifications by November 5").
+   - "suggestion": A proposed idea, suggestion, or recommendation that has not necessarily been approved or accepted (e.g. "We could add notifications next month").
+   - "unresolved_question": An issue or topic requiring clarification or a future decision.
+3. Keep Decisions Distinct: Extracted Decisions represent confirmed architectural, product, or organizational choices. Do not confuse decisions with action items.
+4. Handle Missing Details:
+   - If an owner is not clearly identified or is vague (e.g. "someone on QA should...", "the team will..."), set owner="Unassigned" and ownerStatus="ambiguous".
+   - If a deadline is not explicitly stated or unambiguously inferable, set deadline="Unspecified" and deadlineStatus="missing".
+5. Action Items: All newly extracted items must have status="Pending Approval" so human reviewers can review and approve them.
+6. Traceable Evidence: For each decision and action item, include verbatim quote, speaker name, and timestamp if available in text.
+7. Unresolved Questions: Explicitly identify missing owners, ambiguous deadlines, conflicting instructions, and unanswered questions.
 
 Transcript Content:
 \"\"\"
@@ -118,12 +129,16 @@ Return a valid JSON object matching this exact structure:
     {{
       "title": "Clear action task",
       "description": "Task context and scope",
+      "itemType": "commitment" or "suggestion" or "unresolved_question",
       "owner": "Person Name or Unassigned",
       "ownerStatus": "confirmed" or "ambiguous",
       "deadline": "YYYY-MM-DD or timeframe or Unspecified",
       "deadlineStatus": "confirmed" or "missing",
       "priority": "High" or "Medium" or "Low",
       "status": "Pending Approval",
+      "confidenceScore": 0.95,
+      "relatedDecision": "Decision Title or null",
+      "followUp": "Follow-up note or null",
       "evidence": {{
         "speaker": "Speaker Name",
         "timestamp": "00:00",
@@ -286,10 +301,13 @@ def fallback_heuristic_analysis(text: str, title: str, reason: str = "") -> dict
             is_unassigned = any(w in lower for w in ["someone", "anyone", "we need to"])
             deadline_str = "2026-10-30" if "friday" in lower else ("2026-10-28" if "wednesday" in lower else "Unspecified")
             
+            is_commitment = any(w in lower for w in ["i will", "i'll", "will implement", "committed", "i can"])
             action_items.append({
                 "id": f"act-{idx}",
                 "title": re.sub(r"^\[.*?\]\s*[^:]+:\s*", "", l)[:80],
                 "description": f"Extracted task from transcript: \"{l[:120]}\"",
+                "itemType": "commitment" if is_commitment else "suggestion",
+                "confidenceScore": 0.90 if is_commitment else 0.75,
                 "owner": "Unassigned" if is_unassigned else speaker,
                 "ownerStatus": "ambiguous" if is_unassigned else "confirmed",
                 "deadline": deadline_str,
