@@ -62,28 +62,38 @@ def get_db_cursor(commit=False):
         raise ConnectionError("Database not configured or connection failed.")
 
     conn = _db_pool.getconn()
-    if getattr(conn, 'closed', 0) != 0:
+    # Check if borrowed connection is truly alive (Neon serverless drops idle connections)
+    try:
+        if getattr(conn, 'closed', 0) != 0:
+            raise psycopg2.OperationalError("Connection is closed.")
+        with conn.cursor() as test_cur:
+            test_cur.execute("SELECT 1;")
+    except Exception:
         try:
             _db_pool.putconn(conn, close=True)
         except Exception:
             pass
         conn = _db_pool.getconn()
 
+    conn_broken = False
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         yield cursor
         if commit:
             conn.commit()
+    except psycopg2.OperationalError:
+        conn_broken = True
+        raise
     except Exception:
         try:
             if getattr(conn, 'closed', 0) == 0:
                 conn.rollback()
         except Exception:
-            pass
+            conn_broken = True
         raise
     finally:
         try:
-            _db_pool.putconn(conn, close=bool(getattr(conn, 'closed', 0) != 0))
+            _db_pool.putconn(conn, close=bool(conn_broken or getattr(conn, 'closed', 0) != 0))
         except Exception:
             pass
 
@@ -247,6 +257,30 @@ def init_schema():
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- 6. Teams Table
+    CREATE TABLE IF NOT EXISTS teams (
+        id VARCHAR(64) PRIMARY KEY,
+        name VARCHAR(128) NOT NULL,
+        description TEXT,
+        lead_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 7. Team Memberships Table
+    CREATE TABLE IF NOT EXISTS team_members (
+        id SERIAL PRIMARY KEY,
+        team_id VARCHAR(64) NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+        user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role VARCHAR(32) DEFAULT 'member',
+        joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(team_id, user_id)
+    );
+
+    -- Safe migrations to link meetings and action items to teams
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS team_id VARCHAR(64) REFERENCES teams(id) ON DELETE SET NULL;
+    ALTER TABLE action_items ADD COLUMN IF NOT EXISTS assignee_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL;
+
     -- Indexes for fast filtering and status querying
     CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
     CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
@@ -266,6 +300,11 @@ def init_schema():
     CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);
     CREATE INDEX IF NOT EXISTS idx_meeting_participants_meeting ON meeting_participants(meeting_id);
     CREATE INDEX IF NOT EXISTS idx_meeting_participants_user ON meeting_participants(user_id);
+    CREATE INDEX IF NOT EXISTS idx_teams_lead ON teams(lead_id);
+    CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id);
+    CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id);
+    CREATE INDEX IF NOT EXISTS idx_meetings_team ON meetings(team_id);
+    CREATE INDEX IF NOT EXISTS idx_action_items_assignee ON action_items(assignee_id);
     """
 
     try:
@@ -276,6 +315,7 @@ def init_schema():
         seed_default_data_if_empty()
         seed_default_meetings()
         bootstrap_admin_from_env_if_set()
+        seed_team_lead_and_teams()
         return True
     except Exception as e:
         logger.error(f"Failed to initialize schema in PostgreSQL: {e}")
@@ -792,6 +832,89 @@ def bootstrap_admin_from_env_if_set():
     except Exception as e:
         logger.warning(f"Admin bootstrap notice: {e}")
 
+def seed_team_lead_and_teams():
+    """
+    Bootstrap initial Team Lead account and assign sample team with real member associations.
+    """
+    if not get_connection_url():
+        return
+    
+    tl_email = "teamlead@commitflow.dev"
+    tl_pwd = "Lead@CommitFlow2026!"
+    tl_name = "Alex Rivera"
+
+    try:
+        with get_db_cursor(commit=True) as cur:
+            # 1. Provision Team Lead user if not existing
+            cur.execute("SELECT id, role FROM users WHERE email = %s;", (tl_email,))
+            existing_tl = cur.fetchone()
+            if existing_tl:
+                tl_id = existing_tl['id']
+                if existing_tl['role'] != 'team_lead':
+                    cur.execute("UPDATE users SET role = 'team_lead' WHERE id = %s;", (tl_id,))
+            else:
+                tl_id = "usr-tl-alexrivera"
+                pwd_hash = generate_password_hash(tl_pwd)
+                cur.execute("""
+                    INSERT INTO users (id, name, email, password_hash, role, status)
+                    VALUES (%s, %s, %s, %s, 'team_lead', 'active');
+                """, (tl_id, tl_name, tl_email, pwd_hash))
+                logger.info(f"Provisioned initial Team Lead '{tl_email}'.")
+
+            # 2. Provision initial Team: "Engineering Core"
+            team_id = "team-engineering"
+            cur.execute("SELECT id FROM teams WHERE id = %s;", (team_id,))
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO teams (id, name, description, lead_id)
+                    VALUES (%s, 'Engineering Core', 'Core product engineering and platform architecture team.', %s);
+                """, (team_id, tl_id))
+                logger.info("Provisioned initial team 'Engineering Core'.")
+            else:
+                cur.execute("UPDATE teams SET lead_id = %s WHERE id = %s;", (tl_id, team_id))
+
+            # 3. Add members to team
+            # Add team lead
+            cur.execute("""
+                INSERT INTO team_members (team_id, user_id, role)
+                VALUES (%s, %s, 'lead')
+                ON CONFLICT (team_id, user_id) DO NOTHING;
+            """, (team_id, tl_id))
+
+            # Add existing active users
+            cur.execute("""
+                SELECT id FROM users 
+                WHERE role = 'user' AND status = 'active'
+                ORDER BY created_at ASC LIMIT 4;
+            """)
+            users_to_add = cur.fetchall()
+            for u in users_to_add:
+                cur.execute("""
+                    INSERT INTO team_members (team_id, user_id, role)
+                    VALUES (%s, %s, 'member')
+                    ON CONFLICT (team_id, user_id) DO NOTHING;
+                """, (team_id, u['id']))
+
+            # 4. Associate meetings with this team
+            cur.execute("""
+                UPDATE meetings 
+                SET team_id = %s 
+                WHERE id IN ('weekly-standup', 'eng-sprint', 'q4-strategy', 'design-review', 'lead-sync');
+            """, (team_id,))
+
+            # 5. Link action items to team members
+            if users_to_add:
+                sample_member_id = users_to_add[0]['id']
+                cur.execute("""
+                    UPDATE action_items 
+                    SET assignee_id = %s 
+                    WHERE transcript_id IN ('weekly-standup', 'eng-sprint', 'tx-2092515824')
+                    AND assignee_id IS NULL;
+                """, (sample_member_id,))
+
+    except Exception as e:
+        logger.warning(f"Team Lead / Team bootstrap notice: {e}")
+
 def create_user(name, email, password, role="user"):
     """
     Register a new user account.
@@ -810,7 +933,7 @@ def create_user(name, email, password, role="user"):
         raise ValueError("Password must be at least 6 characters.")
     
     # Strictly validate role
-    if role not in ("user", "admin"):
+    if role not in ("user", "team_lead", "admin"):
         role = "user"
 
     with get_db_cursor(commit=True) as cur:
@@ -1007,8 +1130,8 @@ def update_user_role(user_id, new_role, actor_admin=None):
     """
     if not get_connection_url():
         raise ConnectionError("Database not connected.")
-    if new_role not in ('user', 'admin'):
-        raise ValueError("Invalid role. Must be 'user' or 'admin'.")
+    if new_role not in ('user', 'team_lead', 'admin'):
+        raise ValueError("Invalid role. Must be 'user', 'team_lead', or 'admin'.")
 
     with get_db_cursor(commit=True) as cur:
         cur.execute("SELECT id, name, email, role, status FROM users WHERE id = %s;", (user_id,))
@@ -1401,7 +1524,7 @@ def get_meeting_by_id(meeting_id):
     with get_db_cursor(commit=False) as cur:
         cur.execute("""
             SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
-                   m.status, m.is_private as "isPrivate",
+                   m.status, m.is_private as "isPrivate", m.team_id as "teamId",
                    to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
                    u.name as "hostName", u.email as "hostEmail",
                    (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
@@ -1438,7 +1561,7 @@ def list_meetings(user_id=None, is_admin=False):
         if is_admin:
             cur.execute("""
                 SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
-                       m.status, m.is_private as "isPrivate",
+                       m.status, m.is_private as "isPrivate", m.team_id as "teamId",
                        to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
                        u.name as "hostName", u.email as "hostEmail",
                        (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
@@ -1449,22 +1572,24 @@ def list_meetings(user_id=None, is_admin=False):
         elif user_id:
             cur.execute("""
                 SELECT DISTINCT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
-                       m.status, m.is_private as "isPrivate",
+                       m.status, m.is_private as "isPrivate", m.team_id as "teamId",
                        to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
                        u.name as "hostName", u.email as "hostEmail",
                        (SELECT COUNT(*) FROM meeting_participants mp2 WHERE mp2.meeting_id = m.id) as "participantCount"
                 FROM meetings m
                 LEFT JOIN users u ON m.host_id = u.id
                 LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id
+                LEFT JOIN teams t ON t.id = m.team_id
                 WHERE m.is_private = FALSE 
                    OR m.host_id = %s 
                    OR mp.user_id = %s
+                   OR t.lead_id = %s
                 ORDER BY m.created_at DESC;
-            """, (user_id, user_id))
+            """, (user_id, user_id, user_id))
         else:
             cur.execute("""
                 SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
-                       m.status, m.is_private as "isPrivate",
+                       m.status, m.is_private as "isPrivate", m.team_id as "teamId",
                        to_char(m.created_at, 'Mon DD, YYYY, HH12:MI AM') as "createdAt",
                        u.name as "hostName",
                        (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
@@ -1493,6 +1618,12 @@ def can_user_access_meeting(meeting_id, user_id, is_admin=False):
     # Private meeting: user must be the host or invited participant
     if meeting.get("hostId") and meeting["hostId"] == user_id:
         return True, "Access granted as meeting host.", meeting
+
+    # Check if user is Team Lead of the meeting's team
+    if meeting.get("teamId"):
+        team = get_team_by_id(meeting["teamId"])
+        if team and team.get("leadId") == user_id:
+            return True, "Access granted as authorized Team Lead.", meeting
 
     if not get_connection_url():
         return False, "Database not connected.", None
@@ -1595,9 +1726,10 @@ def get_calendar_meetings(user_id=None, year=None, month=None, is_admin=False):
                         m.is_private = FALSE
                         OR m.host_id = %s
                         OR mp_user.user_id IS NOT NULL
+                        OR m.team_id IN (SELECT id FROM teams WHERE lead_id = %s)
                     )
                 """
-                params.append(user_id)
+                params.extend([user_id, user_id])
             else:
                 query += " AND m.is_private = FALSE"
 
@@ -1660,5 +1792,525 @@ def get_calendar_meetings(user_id=None, year=None, month=None, is_admin=False):
             })
 
         return results
+
+# =============================================================
+# Team & Team Lead Management
+# =============================================================
+
+def get_teams():
+    """Retrieve list of all teams with lead details, member count, and meeting count."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT t.id, t.name, t.description, t.lead_id as "leadId",
+                   u.name as "leadName", u.email as "leadEmail",
+                   to_char(t.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as "membersCount",
+                   (SELECT COUNT(*) FROM meetings m WHERE m.team_id = t.id) as "meetingsCount"
+            FROM teams t
+            LEFT JOIN users u ON t.lead_id = u.id
+            ORDER BY t.name ASC;
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+def get_team_by_id(team_id):
+    """Retrieve a single team by ID."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT t.id, t.name, t.description, t.lead_id as "leadId",
+                   u.name as "leadName", u.email as "leadEmail",
+                   to_char(t.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as "membersCount",
+                   (SELECT COUNT(*) FROM meetings m WHERE m.team_id = t.id) as "meetingsCount"
+            FROM teams t
+            LEFT JOIN users u ON t.lead_id = u.id
+            WHERE t.id = %s;
+        """, (team_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def get_team_by_lead_id(user_id):
+    """Retrieve team where the user is lead_id or lead member."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT t.id, t.name, t.description, t.lead_id as "leadId",
+                   u.name as "leadName", u.email as "leadEmail",
+                   to_char(t.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as "membersCount",
+                   (SELECT COUNT(*) FROM meetings m WHERE m.team_id = t.id) as "meetingsCount"
+            FROM teams t
+            LEFT JOIN users u ON t.lead_id = u.id
+            WHERE t.lead_id = %s
+            LIMIT 1;
+        """, (user_id,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        
+        # Fallback check: user is in team_members with role='lead'
+        cur.execute("""
+            SELECT t.id, t.name, t.description, t.lead_id as "leadId",
+                   u.name as "leadName", u.email as "leadEmail",
+                   to_char(t.created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+                   (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as "membersCount",
+                   (SELECT COUNT(*) FROM meetings m WHERE m.team_id = t.id) as "meetingsCount"
+            FROM team_members tm
+            JOIN teams t ON tm.team_id = t.id
+            LEFT JOIN users u ON t.lead_id = u.id
+            WHERE tm.user_id = %s AND tm.role = 'lead'
+            LIMIT 1;
+        """, (user_id,))
+        fallback_row = cur.fetchone()
+        return dict(fallback_row) if fallback_row else None
+
+def create_team(name, description="", lead_id=None):
+    """Create a new team (Admin operation)."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Team name is required.")
+    
+    team_id = f"team-{uuid.uuid4().hex[:8]}"
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO teams (id, name, description, lead_id)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, name, description, lead_id, created_at;
+        """, (team_id, name, description, lead_id))
+        team = dict(cur.fetchone())
+        
+        if lead_id:
+            cur.execute("""
+                INSERT INTO team_members (team_id, user_id, role)
+                VALUES (%s, %s, 'lead')
+                ON CONFLICT (team_id, user_id) DO UPDATE SET role = 'lead';
+            """, (team_id, lead_id))
+        return team
+
+def update_team(team_id, name, description="", lead_id=None):
+    """Update team details and lead assignment."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Team name is required.")
+        
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            UPDATE teams
+            SET name = %s, description = %s, lead_id = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            RETURNING id, name, description, lead_id;
+        """, (name, description, lead_id, team_id))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Team '{team_id}' not found.")
+        
+        if lead_id:
+            cur.execute("""
+                INSERT INTO team_members (team_id, user_id, role)
+                VALUES (%s, %s, 'lead')
+                ON CONFLICT (team_id, user_id) DO UPDATE SET role = 'lead';
+            """, (team_id, lead_id))
+        return dict(row)
+
+def delete_team(team_id):
+    """Delete a team."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM teams WHERE id = %s;", (team_id,))
+        return cur.rowcount > 0
+
+def get_team_members(team_id):
+    """Retrieve actual team members assigned to team with participation metrics."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT tm.id as "membershipId", tm.role as "teamRole",
+                   to_char(tm.joined_at, 'YYYY-MM-DD') as "joinedAt",
+                   u.id as "userId", u.name, u.email, u.role as "platformRole", u.status,
+                   to_char(u.last_login_at, 'YYYY-MM-DD HH24:MI:SS') as "lastLoginAt",
+                   (
+                       SELECT COUNT(*) 
+                       FROM meeting_participants mp 
+                       JOIN meetings m ON mp.meeting_id = m.id 
+                       WHERE mp.user_id = u.id AND m.team_id = tm.team_id
+                   ) as "teamMeetingsAttended",
+                   (
+                       SELECT COUNT(*) 
+                       FROM action_items a 
+                       JOIN meetings m ON a.transcript_id = m.id 
+                       WHERE a.assignee_id = u.id AND m.team_id = tm.team_id
+                   ) as "assignedActionItemsCount"
+            FROM team_members tm
+            JOIN users u ON tm.user_id = u.id
+            WHERE tm.team_id = %s
+            ORDER BY tm.role DESC, u.name ASC;
+        """, (team_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+def add_team_member(team_id, user_id, role='member'):
+    """Add a member to a team."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    with get_db_cursor(commit=True) as cur:
+        # Check team exists
+        cur.execute("SELECT id FROM teams WHERE id = %s;", (team_id,))
+        if not cur.fetchone():
+            raise ValueError(f"Team '{team_id}' not found.")
+        # Check user exists
+        cur.execute("SELECT id, name FROM users WHERE id = %s;", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            raise ValueError(f"User '{user_id}' not found.")
+            
+        cur.execute("""
+            INSERT INTO team_members (team_id, user_id, role)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role;
+        """, (team_id, user_id, role))
+        return True
+
+def remove_team_member(team_id, user_id):
+    """Remove a member from a team."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    with get_db_cursor(commit=True) as cur:
+        # Check if user is the assigned lead
+        cur.execute("SELECT lead_id FROM teams WHERE id = %s;", (team_id,))
+        team = cur.fetchone()
+        if team and team['lead_id'] == user_id:
+            raise ValueError("Cannot remove the primary Team Lead from the team. Reassign team lead first.")
+        cur.execute("DELETE FROM team_members WHERE team_id = %s AND user_id = %s;", (team_id, user_id))
+        return cur.rowcount > 0
+
+def get_team_meetings(team_id, limit=50, offset=0):
+    """Retrieve meetings belonging to this team."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT m.id, m.title, m.room_name as "roomName", m.host_id as "hostId",
+                   m.status, m.is_private as "isPrivate", m.duration,
+                   to_char(COALESCE(m.scheduled_at, m.created_at), 'YYYY-MM-DD') as "date",
+                   to_char(COALESCE(m.scheduled_at, m.created_at), 'HH12:MI AM') as "time",
+                   to_char(COALESCE(m.scheduled_at, m.created_at), 'YYYY-MM-DD HH24:MI:SS') as "scheduledAt",
+                   u.name as "hostName", u.email as "hostEmail",
+                   (SELECT COUNT(*) FROM meeting_participants mp WHERE mp.meeting_id = m.id) as "participantCount"
+            FROM meetings m
+            LEFT JOIN users u ON m.host_id = u.id
+            WHERE m.team_id = %s
+            ORDER BY COALESCE(m.scheduled_at, m.created_at) DESC
+            LIMIT %s OFFSET %s;
+        """, (team_id, limit, offset))
+        return [dict(r) for r in cur.fetchall()]
+
+def create_team_meeting(title, host_id, team_id, scheduled_at=None, duration="30 min", participant_ids=None):
+    """Create and schedule a meeting scoped to a team."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("Meeting title is required.")
+        
+    meeting_id = f"m-tm-{uuid.uuid4().hex[:8]}"
+    room_name = f"cf-room-{uuid.uuid4().hex[:8]}"
+    
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("""
+            INSERT INTO meetings (id, title, room_name, host_id, status, is_private, scheduled_at, duration, team_id)
+            VALUES (%s, %s, %s, %s, 'scheduled', FALSE, %s, %s, %s)
+            RETURNING id, title, room_name, host_id, status, duration, scheduled_at;
+        """, (meeting_id, title, room_name, host_id, scheduled_at, duration, team_id))
+        created = dict(cur.fetchone())
+        
+        # Add host as participant
+        cur.execute("""
+            INSERT INTO meeting_participants (meeting_id, user_id, role)
+            VALUES (%s, %s, 'host')
+            ON CONFLICT (meeting_id, user_id) DO NOTHING;
+        """, (meeting_id, host_id))
+        
+        # Add team member participants
+        if participant_ids and isinstance(participant_ids, list):
+            for pid in participant_ids:
+                if pid and pid != host_id:
+                    cur.execute("""
+                        INSERT INTO meeting_participants (meeting_id, user_id, role)
+                        VALUES (%s, %s, 'participant')
+                        ON CONFLICT (meeting_id, user_id) DO NOTHING;
+                    """, (meeting_id, pid))
+                    
+        return created
+
+def get_team_transcripts(team_id):
+    """Retrieve meeting transcripts and summaries belonging to this team."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT t.id, t.title, t.status, t.duration,
+                   to_char(t.uploaded_at, 'Mon DD, YYYY, HH12:MI AM') as "uploadedAt",
+                   t.participants,
+                   s.overview as "summaryOverview",
+                   (SELECT COUNT(*) FROM action_items a WHERE a.transcript_id = t.id) as "actionItemsCount",
+                   (SELECT COUNT(*) FROM decisions d WHERE d.transcript_id = t.id) as "decisionsCount",
+                   (SELECT COUNT(*) FROM unresolved_questions uq WHERE uq.transcript_id = t.id) as "unresolvedQuestionsCount"
+            FROM transcripts t
+            LEFT JOIN meetings m ON (m.id = t.id OR m.room_name = t.filename)
+            LEFT JOIN meeting_summaries s ON s.transcript_id = t.id
+            WHERE m.team_id = %s OR t.user_id IN (SELECT user_id FROM team_members WHERE team_id = %s)
+            ORDER BY t.created_at DESC;
+        """, (team_id, team_id))
+        return [dict(r) for r in cur.fetchall()]
+
+def get_team_action_items(team_id):
+    """Retrieve action items for this team's meetings with assigned member details."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT a.id, a.transcript_id as "sourceMeetingId",
+                   COALESCE(m.title, t.title, 'Team Meeting') as "sourceMeetingTitle",
+                   a.title, a.description,
+                   a.owner, a.owner_status as "ownerStatus",
+                   a.deadline, a.deadline_status as "deadlineStatus",
+                   a.priority, a.status,
+                   a.assignee_id as "assigneeId",
+                   u.name as "assigneeName", u.email as "assigneeEmail",
+                   a.evidence_speaker as "evidenceSpeaker",
+                   a.evidence_timestamp as "evidenceTimestamp",
+                   a.evidence_quote as "evidenceQuote",
+                   to_char(a.created_at, 'YYYY-MM-DD HH24:MI') as "createdAt"
+            FROM action_items a
+            LEFT JOIN transcripts t ON a.transcript_id = t.id
+            LEFT JOIN meetings m ON (m.id = a.transcript_id OR m.id = t.id)
+            LEFT JOIN users u ON a.assignee_id = u.id
+            WHERE m.team_id = %s
+               OR a.assignee_id IN (SELECT user_id FROM team_members WHERE team_id = %s)
+            ORDER BY a.created_at DESC;
+        """, (team_id, team_id))
+        return [dict(r) for r in cur.fetchall()]
+
+def assign_team_action_item(action_id, assignee_id, team_id=None):
+    """Assign an action item to a valid team member."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    with get_db_cursor(commit=True) as cur:
+        # Verify user
+        cur.execute("SELECT id, name FROM users WHERE id = %s;", (assignee_id,))
+        user = cur.fetchone()
+        if not user:
+            raise ValueError(f"Assignee user '{assignee_id}' not found.")
+            
+        cur.execute("""
+            UPDATE action_items
+            SET assignee_id = %s, owner = %s, owner_status = 'confirmed', updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s;
+        """, (assignee_id, user['name'], action_id))
+        return cur.rowcount > 0
+
+def update_team_action_item(action_id, status=None, deadline=None):
+    """Update status and deadline of a team action item."""
+    if not get_connection_url():
+        raise ConnectionError("Database not connected.")
+    with get_db_cursor(commit=True) as cur:
+        updates = []
+        params = []
+        if status:
+            updates.append("status = %s")
+            params.append(status)
+        if deadline:
+            updates.append("deadline = %s, deadline_status = 'confirmed'")
+            params.append(deadline)
+        if not updates:
+            return True
+            
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        query = f"UPDATE action_items SET {', '.join(updates)} WHERE id = %s;"
+        params.append(action_id)
+        cur.execute(query, tuple(params))
+        return cur.rowcount > 0
+
+def get_team_lead_stats(user_id):
+    """Retrieve comprehensive dashboard stats and recent records for Team Lead."""
+    if not get_connection_url():
+        return {
+            "hasTeam": False,
+            "team": None,
+            "stats": {"membersCount": 0, "upcomingMeetingsCount": 0, "completedMeetingsCount": 0, "pendingActionItemsCount": 0, "completedActionItemsCount": 0, "overdueActionItemsCount": 0},
+            "recentMeetings": [],
+            "recentActionItems": []
+        }
+        
+    team = get_team_by_lead_id(user_id)
+    if not team:
+        return {
+            "hasTeam": False,
+            "team": None,
+            "stats": {"membersCount": 0, "upcomingMeetingsCount": 0, "completedMeetingsCount": 0, "pendingActionItemsCount": 0, "completedActionItemsCount": 0, "overdueActionItemsCount": 0},
+            "recentMeetings": [],
+            "recentActionItems": []
+        }
+        
+    team_id = team["id"]
+    with get_db_cursor(commit=False) as cur:
+        # Members count
+        cur.execute("SELECT COUNT(*) as count FROM team_members WHERE team_id = %s;", (team_id,))
+        members_count = cur.fetchone()['count']
+        
+        # Upcoming & completed meetings count
+        cur.execute("""
+            SELECT 
+                COUNT(*) FILTER (WHERE status IN ('scheduled', 'upcoming', 'live')) as upcoming,
+                COUNT(*) FILTER (WHERE status IN ('done', 'ended')) as completed
+            FROM meetings
+            WHERE team_id = %s;
+        """, (team_id,))
+        meeting_counts = cur.fetchone()
+        upcoming_meetings = meeting_counts['upcoming'] or 0
+        completed_meetings = meeting_counts['completed'] or 0
+        
+        # Action items count
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE a.status = 'Pending Approval') as pending,
+                COUNT(*) FILTER (WHERE a.status IN ('Completed', 'Approved')) as completed
+            FROM action_items a
+            LEFT JOIN meetings m ON a.transcript_id = m.id
+            WHERE m.team_id = %s OR a.assignee_id IN (SELECT user_id FROM team_members WHERE team_id = %s);
+        """, (team_id, team_id))
+        action_counts = cur.fetchone()
+        pending_actions = action_counts['pending'] or 0
+        completed_actions = action_counts['completed'] or 0
+        
+        # Recent meetings
+        recent_meetings = get_team_meetings(team_id, limit=5, offset=0)
+        
+        # Recent action items
+        recent_actions = get_team_action_items(team_id)[:5]
+        
+        return {
+            "hasTeam": True,
+            "team": team,
+            "stats": {
+                "membersCount": members_count,
+                "upcomingMeetingsCount": upcoming_meetings,
+                "completedMeetingsCount": completed_meetings,
+                "pendingActionItemsCount": pending_actions,
+                "completedActionItemsCount": completed_actions,
+                "overdueActionItemsCount": 0
+            },
+            "recentMeetings": recent_meetings,
+            "recentActionItems": recent_actions
+        }
+
+def get_team_reports(team_id):
+    """Retrieve data-backed team productivity and meeting reports."""
+    if not get_connection_url():
+        return None
+    with get_db_cursor(commit=False) as cur:
+        # Total meetings by status
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status IN ('done', 'ended')) as completed,
+                COUNT(*) FILTER (WHERE status IN ('scheduled', 'upcoming')) as scheduled,
+                COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
+            FROM meetings
+            WHERE team_id = %s;
+        """, (team_id,))
+        meetings_stat = dict(cur.fetchone())
+        
+        # Attendance statistics for completed meetings
+        cur.execute("""
+            SELECT 
+                COUNT(*) FILTER (WHERE mp.attended = TRUE OR mp.joined_at IS NOT NULL) as attended,
+                COUNT(*) FILTER (WHERE mp.attended = FALSE OR (mp.attended IS NULL AND mp.joined_at IS NULL)) as missed
+            FROM meetings m
+            JOIN meeting_participants mp ON m.id = mp.meeting_id
+            WHERE m.team_id = %s AND m.status IN ('done', 'ended');
+        """, (team_id,))
+        att_row = cur.fetchone()
+        attended = att_row['attended'] or 0
+        missed = att_row['missed'] or 0
+        total_att = attended + missed
+        attendance_rate = round((attended / total_att * 100), 1) if total_att > 0 else 0
+        
+        # Action item completion metrics
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE a.status IN ('Completed', 'Approved')) as completed,
+                COUNT(*) FILTER (WHERE a.status = 'Pending Approval') as pending,
+                COUNT(*) FILTER (WHERE a.priority = 'High') as high_priority
+            FROM action_items a
+            LEFT JOIN meetings m ON a.transcript_id = m.id
+            WHERE m.team_id = %s OR a.assignee_id IN (SELECT user_id FROM team_members WHERE team_id = %s);
+        """, (team_id, team_id))
+        ai_row = dict(cur.fetchone())
+        total_ai = ai_row['total'] or 0
+        completed_ai = ai_row['completed'] or 0
+        ai_rate = round((completed_ai / total_ai * 100), 1) if total_ai > 0 else 0
+        
+        # Member breakdown
+        members = get_team_members(team_id)
+        
+        return {
+            "meetings": {
+                "total": meetings_stat['total'] or 0,
+                "completed": meetings_stat['completed'] or 0,
+                "scheduled": meetings_stat['scheduled'] or 0,
+                "cancelled": meetings_stat['cancelled'] or 0,
+                "attendanceRate": attendance_rate,
+                "totalAttended": attended,
+                "totalMissed": missed
+            },
+            "actionItems": {
+                "total": total_ai,
+                "completed": completed_ai,
+                "pending": ai_row['pending'] or 0,
+                "highPriority": ai_row['high_priority'] or 0,
+                "completionRate": ai_rate
+            },
+            "members": members
+        }
+
+def get_eligible_team_leads():
+    """Retrieve users eligible to be assigned as team leads."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT id, name, email, role, status
+            FROM users
+            WHERE status = 'active'
+            ORDER BY CASE WHEN role = 'team_lead' THEN 0 WHEN role = 'admin' THEN 1 ELSE 2 END, name ASC;
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+def get_available_users_for_team(team_id):
+    """Retrieve registered users who are not yet in the specified team."""
+    if not get_connection_url():
+        return []
+    with get_db_cursor(commit=False) as cur:
+        cur.execute("""
+            SELECT id, name, email, role, status
+            FROM users
+            WHERE status = 'active'
+              AND id NOT IN (SELECT user_id FROM team_members WHERE team_id = %s)
+            ORDER BY name ASC;
+        """, (team_id,))
+        return [dict(r) for r in cur.fetchall()]
+
 
 
