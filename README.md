@@ -62,20 +62,29 @@ npm install
 
 ## 4. Running the Application
 
-### Option A: Run Backend and Frontend Concurrently
+### Single Command (Recommended)
+
+Start both the backend and frontend simultaneously with one command:
+
+```powershell
+python start.py
+# or on Windows, simply run:
+start.bat
+```
+
+*This automatically starts the Flask backend on port 5000, starts the Vite frontend on port 5173, streams color-coded output, and opens your browser.*
+
+### Alternative: Run in Separate Terminals
 
 **Terminal 1 (Backend API):**
 ```bash
 python server/app.py
-# or: npm run server
 ```
-*The backend automatically initializes tables in Neon PostgreSQL on first boot.*
 
 **Terminal 2 (Frontend Dev Server):**
 ```bash
 npm run dev
 ```
-*Frontend will be accessible at `http://localhost:5173` with all `/api` requests proxied to the Flask server.*
 
 ---
 
