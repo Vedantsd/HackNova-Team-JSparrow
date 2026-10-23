@@ -29,6 +29,7 @@ export default function Header({ query, setQuery, onMenu }) {
   const { theme, setTheme } = useTheme()
   const { user, logout, isAdmin } = useAuth()
   const [modal, setModal] = useState(false)
+  const [creatingMeeting, setCreatingMeeting] = useState(false)
   const [bell, setBell] = useState(false)
   const [notifications, setNotifications] = useState([])
   const [readIds, setReadIds] = useState(() => {
@@ -311,8 +312,27 @@ export default function Header({ query, setQuery, onMenu }) {
         <Modal title="New meeting" onClose={() => setModal(false)}>
           <p className="muted">Start an instant meeting room or upload a transcript for AI analysis.</p>
           <div className="row" style={{ marginTop: '16px' }}>
-            <button className="btn primary" onClick={() => { setModal(false); nav('/meetings/new/live') }}>
-              Start Meeting Room
+            <button 
+              className="btn primary" 
+              disabled={creatingMeeting}
+              onClick={async () => {
+                setCreatingMeeting(true)
+                try {
+                  const m = await api.createMeeting({
+                    title: `${user?.name || 'User'}'s Live Room`,
+                    isPrivate: false
+                  })
+                  setModal(false)
+                  nav(`/meetings/${m.id}/live`)
+                } catch {
+                  setModal(false)
+                  nav('/meetings/new/live')
+                } finally {
+                  setCreatingMeeting(false)
+                }
+              }}
+            >
+              {creatingMeeting ? 'Starting...' : 'Start Meeting Room'}
             </button>
             <button className="btn" onClick={() => { setModal(false); nav('/transcripts') }}>
               Upload Transcript
