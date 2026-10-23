@@ -204,6 +204,7 @@ export default function AdminUsers() {
             >
               <option value="">All Roles</option>
               <option value="user">User</option>
+              <option value="team_lead">Team Lead</option>
               <option value="admin">Administrator</option>
             </select>
           </div>
@@ -270,7 +271,29 @@ export default function AdminUsers() {
               ) : (
                 users.map((u) => {
                   const isAdmin = u.role === 'admin'
+                  const isLead = u.role === 'team_lead'
                   const isActive = u.status === 'active'
+
+                  const roleBadgeStyle = isAdmin
+                    ? {
+                        bg: 'rgba(99, 102, 241, 0.15)',
+                        color: 'var(--color-primary)',
+                        border: 'rgba(99, 102, 241, 0.35)',
+                        label: 'Admin'
+                      }
+                    : isLead
+                    ? {
+                        bg: 'rgba(6, 182, 212, 0.15)',
+                        color: '#22d3ee',
+                        border: 'rgba(6, 182, 212, 0.35)',
+                        label: 'Team Lead'
+                      }
+                    : {
+                        bg: 'var(--color-soft)',
+                        color: 'var(--color-muted)',
+                        border: 'var(--color-border)',
+                        label: 'User'
+                      }
 
                   return (
                     <tr
@@ -287,8 +310,8 @@ export default function AdminUsers() {
                             width: '32px',
                             height: '32px',
                             borderRadius: '8px',
-                            background: isAdmin ? 'linear-gradient(135deg, #10b981, #059669)' : 'var(--color-soft)',
-                            color: isAdmin ? '#fff' : 'var(--color-primary)',
+                            background: isAdmin ? 'linear-gradient(135deg, #6366f1, #4f46e5)' : isLead ? 'linear-gradient(135deg, #06b6d4, #0891b2)' : 'var(--color-soft)',
+                            color: (isAdmin || isLead) ? '#fff' : 'var(--color-primary)',
                             border: '1px solid var(--color-border)',
                             display: 'grid',
                             placeItems: 'center',
@@ -315,12 +338,12 @@ export default function AdminUsers() {
                           fontWeight: 600,
                           padding: '3px 8px',
                           borderRadius: '6px',
-                          background: isAdmin ? 'rgba(99, 102, 241, 0.15)' : 'var(--color-soft)',
-                          color: isAdmin ? 'var(--color-primary)' : 'var(--color-muted)',
-                          border: `1px solid ${isAdmin ? 'rgba(99, 102, 241, 0.35)' : 'var(--color-border)'}`
+                          background: roleBadgeStyle.bg,
+                          color: roleBadgeStyle.color,
+                          border: `1px solid ${roleBadgeStyle.border}`
                         }}>
-                          {isAdmin ? <ShieldCheck size={13} /> : <Shield size={13} />}
-                          <span>{isAdmin ? 'Admin' : 'User'}</span>
+                          {isAdmin ? <ShieldCheck size={13} /> : isLead ? <Users size={13} /> : <Shield size={13} />}
+                          <span>{roleBadgeStyle.label}</span>
                         </span>
                       </td>
 
@@ -365,7 +388,38 @@ export default function AdminUsers() {
 
                       {/* Actions */}
                       <td style={{ padding: '14px 18px', textAlign: 'right' }}>
-                        <div style={{ display: 'inline-flex', gap: '6px' }}>
+                        <div style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}>
+                          {/* Role selector */}
+                          <select
+                            value={u.role}
+                            onChange={(e) => {
+                              const newRole = e.target.value
+                              if (newRole !== u.role) {
+                                setConfirmModal({
+                                  type: 'role',
+                                  user: u,
+                                  targetVal: newRole
+                                })
+                              }
+                            }}
+                            style={{
+                              height: '30px',
+                              borderRadius: '6px',
+                              border: '1px solid var(--color-border)',
+                              background: 'var(--color-soft)',
+                              color: 'var(--color-text)',
+                              padding: '0 6px',
+                              fontSize: '11.5px',
+                              fontWeight: 500,
+                              cursor: 'pointer'
+                            }}
+                            title="Assign role"
+                          >
+                            <option value="user">Role: User</option>
+                            <option value="team_lead">Role: Team Lead</option>
+                            <option value="admin">Role: Admin</option>
+                          </select>
+
                           {/* Status toggle */}
                           <button
                             type="button"
@@ -386,22 +440,6 @@ export default function AdminUsers() {
                             {isActive ? <UserX size={13} /> : <UserCheck size={13} />}
                             <span>{isActive ? 'Deactivate' : 'Activate'}</span>
                           </button>
-
-                          {/* Role toggle */}
-                          <button
-                            type="button"
-                            className="btn"
-                            style={{ height: '30px', padding: '0 8px', fontSize: '11.5px' }}
-                            onClick={() => setConfirmModal({
-                              type: 'role',
-                              user: u,
-                              targetVal: isAdmin ? 'user' : 'admin'
-                            })}
-                            title={isAdmin ? 'Demote to regular user' : 'Promote to admin'}
-                          >
-                            {isAdmin ? <Shield size={13} /> : <ShieldCheck size={13} />}
-                            <span>{isAdmin ? 'Make User' : 'Make Admin'}</span>
-                          </button>
                         </div>
                       </td>
                     </tr>
@@ -419,7 +457,7 @@ export default function AdminUsers() {
           title={
             confirmModal.type === 'status'
               ? `${confirmModal.targetVal === 'deactivated' ? 'Deactivate' : 'Activate'} Account`
-              : `${confirmModal.targetVal === 'admin' ? 'Promote to Administrator' : 'Demote to Regular User'}`
+              : `Change Role to ${confirmModal.targetVal === 'admin' ? 'Administrator' : confirmModal.targetVal === 'team_lead' ? 'Team Lead' : 'Regular User'}`
           }
           onClose={() => setConfirmModal(null)}
         >
@@ -443,10 +481,10 @@ export default function AdminUsers() {
               <p className="muted" style={{ margin: 0, fontSize: '13px' }}>
                 Target user: <strong>{confirmModal.user.name}</strong> ({confirmModal.user.email}).
                 {confirmModal.type === 'status' && confirmModal.targetVal === 'deactivated' && (
-                  <span> Deactivating will immediately invalidate all active sessions for this account.</span>
+                  <span> Deactivating will immediately invalidate active sessions for this account.</span>
                 )}
-                {confirmModal.type === 'role' && confirmModal.targetVal === 'user' && (
-                  <span> Demoting will revoke all administrative portal access immediately.</span>
+                {confirmModal.type === 'role' && (
+                  <span> Updating role will alter the user's dashboard access, permissions, and session authorization.</span>
                 )}
               </p>
             </div>
