@@ -24,6 +24,7 @@ import {
 } from 'lucide-react'
 import { api } from '../services/api.js'
 import { transcriptStore } from '../services/transcriptStore.js'
+import { generateMeetingPDF } from '../services/pdfGenerator.js'
 
 export default function MeetingAnalysis() {
   const { id } = useParams()
@@ -123,6 +124,21 @@ export default function MeetingAnalysis() {
     setTimeout(() => setCopied(false), 2000)
   }
 
+  const handleExportPDF = () => {
+    if (!transcript) return
+    generateMeetingPDF({
+      title: transcript.title,
+      date: transcript.uploadedAt || 'Oct 23, 2026',
+      duration: transcript.duration || '30 min',
+      participants: transcript.participants || [],
+      summary: transcript.summary,
+      decisions: transcript.decisions || [],
+      actionItems: transcript.actionItems || [],
+      transcriptEntries: transcript.transcriptText || '',
+      filename: `${(transcript.title || 'Meeting').replace(/[^a-zA-Z0-9_-]/g, '_')}_Summary_Transcript.pdf`
+    })
+  }
+
   const handleDownloadTranscript = () => {
     if (!transcript) return
     const blob = new Blob([transcript.transcriptText], { type: 'text/plain;charset=utf-8' })
@@ -195,9 +211,13 @@ export default function MeetingAnalysis() {
               {copied ? <Check size={14} color="#16a34a" /> : <Copy size={14} />}
               <span className="hide-sm">{copied ? 'Copied' : 'Copy Text'}</span>
             </button>
-            <button className="btn sm" onClick={handleDownloadTranscript} title="Download file">
+            <button className="btn primary sm" onClick={handleExportPDF} title="Download meeting transcript and AI summary mapped into one PDF">
               <Download size={14} />
-              <span className="hide-sm">Export</span>
+              <span>Download PDF</span>
+            </button>
+            <button className="btn sm" onClick={handleDownloadTranscript} title="Export plain text (.txt)">
+              <FileText size={14} />
+              <span className="hide-sm">Export TXT</span>
             </button>
           </div>
         </div>
@@ -557,24 +577,29 @@ export default function MeetingAnalysis() {
               <h3>Original Meeting Transcript</h3>
             </div>
 
-            {/* Inner Search */}
-            <div className="search" style={{ height: '36px', width: '280px' }}>
-              <Search size={14} />
-              <input
-                value={transcriptSearch}
-                onChange={e => setTranscriptSearch(e.target.value)}
-                placeholder="Search speaker or text..."
-                aria-label="Search within transcript"
-              />
-              {transcriptSearch && (
-                <button 
-                  className="muted sm" 
-                  style={{ background: 'none', border: 0, cursor: 'pointer' }}
-                  onClick={() => setTranscriptSearch('')}
-                >
-                  <X size={13} />
-                </button>
-              )}
+            <div className="row" style={{ gap: '8px' }}>
+              <div className="search" style={{ height: '36px', width: '240px' }}>
+                <Search size={14} />
+                <input
+                  value={transcriptSearch}
+                  onChange={e => setTranscriptSearch(e.target.value)}
+                  placeholder="Search speaker or text..."
+                  aria-label="Search within transcript"
+                />
+                {transcriptSearch && (
+                  <button 
+                    className="muted sm" 
+                    style={{ background: 'none', border: 0, cursor: 'pointer' }}
+                    onClick={() => setTranscriptSearch('')}
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+              <button className="btn sm" onClick={handleExportPDF} title="Download transcript and summary as PDF">
+                <Download size={14} />
+                <span className="hide-sm">Download PDF</span>
+              </button>
             </div>
           </div>
 
