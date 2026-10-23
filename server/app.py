@@ -7,7 +7,7 @@ import os
 import threading
 import logging
 import uuid
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -23,7 +23,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("commitflow.server")
 
-app = Flask(__name__)
+DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dist"))
+
+app = Flask(
+    __name__,
+    static_folder=DIST_DIR if os.path.exists(DIST_DIR) else None,
+    static_url_path="/"
+)
 # Enable CORS for frontend requests
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
@@ -314,6 +320,149 @@ def edit_action_item_endpoint(action_id):
                 return jsonify({"id": action_id, "message": "Updated successfully."}), 200
 
     return jsonify({"error": "Action item not found."}), 404
+
+# -------------------------------------------------------------
+# Frontend Application & Landing Page Serving
+# -------------------------------------------------------------
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend_or_status(path):
+    """
+    Serves the built React SPA for non-API routes.
+    If the frontend dist folder is not yet built, renders a friendly status dashboard.
+    """
+    if path.startswith("api"):
+        return jsonify({"error": f"API endpoint '/{path}' not found."}), 404
+
+    # 1. Check if built frontend static file exists in dist
+    if os.path.exists(DIST_DIR):
+        file_path = os.path.join(DIST_DIR, path)
+        if path and os.path.exists(file_path) and os.path.isfile(file_path):
+            return send_from_directory(DIST_DIR, path)
+        
+        # SPA fallback: return index.html for client-side routing
+        index_file = os.path.join(DIST_DIR, "index.html")
+        if os.path.exists(index_file):
+            return send_from_directory(DIST_DIR, "index.html")
+
+    # 2. If dist is not present, render a clean status landing dashboard
+    db_ok, db_msg = db.check_connection()
+    ai_ok, ai_msg = ai.check_gemini_status()
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CommitFlow Backend Service</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(circle at 50% 10%, #172138, #0a0d14);
+      color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 24px;
+      box-sizing: border-box;
+    }}
+    .card {{
+      background: rgba(18, 25, 42, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      backdrop-filter: blur(16px);
+      border-radius: 16px;
+      padding: 36px;
+      max-width: 620px;
+      width: 100%;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+    }}
+    h1 {{
+      font-size: 24px;
+      margin-top: 0;
+      margin-bottom: 8px;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    .badge {{
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 20px;
+    }}
+    .badge-ok {{ background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.35); }}
+    .badge-warn {{ background: rgba(234, 179, 8, 0.15); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.35); }}
+    .status-row {{
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 14px;
+    }}
+    .links {{
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }}
+    a {{
+      color: #38bdf8;
+      text-decoration: none;
+      font-weight: 500;
+    }}
+    a:hover {{ text-decoration: underline; }}
+    .btn {{
+      display: inline-block;
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #ffffff;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-weight: 600;
+      text-decoration: none;
+      margin-top: 16px;
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+    }}
+    .btn:hover {{
+      background: linear-gradient(135deg, #1d4ed8, #1e40af);
+      text-decoration: none;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>CommitFlow Backend Service</h1>
+    <span class="badge badge-ok">&#9679; Online on Port {os.getenv('PORT', 5000)}</span>
+
+    <div class="status-row">
+      <span><strong>Neon PostgreSQL:</strong> {db_msg}</span>
+      <span class="badge {'badge-ok' if db_ok else 'badge-warn'}">{'Connected' if db_ok else 'Fallback'}</span>
+    </div>
+
+    <div class="status-row">
+      <span><strong>Google Gemini AI:</strong> {ai_msg}</span>
+      <span class="badge {'badge-ok' if ai_ok else 'badge-warn'}">{'Ready' if ai_ok else 'Fallback'}</span>
+    </div>
+
+    <div class="links">
+      <p style="margin: 0 0 10px 0; font-size: 14px; color: #94a3b8;">Direct API Endpoints:</p>
+      <ul style="margin: 0 0 16px 0; padding-left: 20px; font-size: 14px; line-height: 1.8;">
+        <li><a href="/api/health">/api/health</a> &mdash; System & credential status</li>
+        <li><a href="/api/transcripts">/api/transcripts</a> &mdash; Transcripts list & upload</li>
+        <li><a href="/api/action-items">/api/action-items</a> &mdash; Tracked action items</li>
+      </ul>
+      <a class="btn" href="http://localhost:5173" target="_blank">Open Vite Frontend (http://localhost:5173) &rarr;</a>
+    </div>
+  </div>
+</body>
+</html>""", 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
