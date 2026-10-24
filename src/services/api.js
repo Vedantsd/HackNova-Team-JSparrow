@@ -1,6 +1,5 @@
-// Service layer connecting to backend REST API or local persistent transcriptStore
+// Service layer connecting to backend REST API
 // Set VITE_API_BASE_URL in .env if running frontend on different host (secrets stay safely on backend).
-import { transcriptStore } from './transcriptStore.js'
 
 const BASE = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -46,82 +45,22 @@ export const api = {
   getMeetingToken: (meetingId) => req(`/api/meetings/${meetingId}/livekit-token`, { method: 'POST' }),
   getCalendar: (year, month) => req(`/api/calendar?year=${year}&month=${month}`),
 
-  listTranscripts: async () => {
-    try {
-      const res = await req('/api/transcripts')
-      if (Array.isArray(res)) {
-        return res
-      }
-    } catch (e) {
-      // Backend unavailable; use local store
-    }
-    return transcriptStore.getTranscripts()
-  },
+  listTranscripts: () => req('/api/transcripts'),
 
-  getTranscript: async id => {
-    try {
-      const res = await req(`/api/transcripts/${id}`)
-      if (res && res.id) return res
-    } catch (e) {
-      // Fallback
-    }
-    return transcriptStore.getTranscript(id)
-  },
+  getTranscript: id => req(`/api/transcripts/${id}`),
 
-  uploadTranscript: async data => {
-    try {
-      const res = await req('/api/transcripts', { method: 'POST', body: JSON.stringify(data) })
-      if (res && res.id) return res
-    } catch (e) {
-      // Fallback
-    }
-    return transcriptStore.addTranscript(data)
-  },
+  uploadTranscript: data => req('/api/transcripts', { method: 'POST', body: JSON.stringify(data) }),
 
-  retryTranscriptProcessing: async id => {
-    try {
-      const res = await req(`/api/transcripts/${id}/retry`, { method: 'POST' })
-      if (res) return res
-    } catch (e) {
-      // Fallback
-    }
-    return transcriptStore.retryProcessing(id)
-  },
+  retryTranscriptProcessing: id => req(`/api/transcripts/${id}/retry`, { method: 'POST' }),
 
   // Action Items
-  listActionItems: async () => {
-    try {
-      const res = await req('/api/action-items')
-      if (Array.isArray(res)) return res
-    } catch (e) {
-      // Fallback
-    }
-    return transcriptStore.getAllActionItems()
-  },
+  listActionItems: () => req('/api/action-items'),
 
-  approveActionItem: async (transcriptId, actionItemId) => {
-    try {
-      const res = await req(`/api/action-items/${actionItemId}/approve`, { method: 'POST' })
-      if (res) return true
-    } catch (e) {}
-    return transcriptStore.updateActionItemStatus(transcriptId, actionItemId, 'Approved')
-  },
+  approveActionItem: (transcriptId, actionItemId) => req(`/api/action-items/${actionItemId}/approve`, { method: 'POST' }),
 
-  rejectActionItem: async (transcriptId, actionItemId) => {
-    try {
-      const res = await req(`/api/action-items/${actionItemId}/reject`, { method: 'POST' })
-      if (res) return true
-    } catch (e) {}
-    return transcriptStore.updateActionItemStatus(transcriptId, actionItemId, 'Rejected')
-  },
+  rejectActionItem: (transcriptId, actionItemId) => req(`/api/action-items/${actionItemId}/reject`, { method: 'POST' }),
 
-  editActionItem: async (transcriptId, actionItemId, updates) => {
-    try {
-      const res = await req(`/api/action-items/${actionItemId}`, { method: 'PUT', body: JSON.stringify(updates) })
-      if (res) return true
-    } catch (e) {}
-    return transcriptStore.editActionItem(transcriptId, actionItemId, updates)
-  },
+  editActionItem: (transcriptId, actionItemId, updates) => req(`/api/action-items/${actionItemId}`, { method: 'PUT', body: JSON.stringify(updates) }),
 
   bulkApproveActionItems: async (actionIds) => {
     return await req('/api/action-items/bulk-approve', {

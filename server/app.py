@@ -50,12 +50,13 @@ CORS(app, supports_credentials=True, resources={
 })
 
 def get_current_user():
-    """Extract and validate current authenticated user from session cookie or Authorization header."""
-    token = request.cookies.get("cf_session")
+    """Extract and validate current authenticated user from Authorization header or session cookie."""
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
     if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
+        token = request.cookies.get("cf_session")
     if not token:
         return None
     return db.get_session_user(token)
@@ -122,11 +123,11 @@ init_backend()
 # Background AI Processing Worker
 # -------------------------------------------------------------
 
-def process_transcript_async(tx_id, text, title):
+def process_transcript_async(tx_id, text, title="CommitFlow Meeting", meeting_date=None):
     """Processes transcript using Gemini in a background thread."""
     logger.info(f"Starting Gemini transcript analysis for ID '{tx_id}'...")
     try:
-        analysis_data = ai.analyze_transcript(text, title)
+        analysis_data = ai.analyze_transcript(text, title, meeting_date=meeting_date)
 
         # 1. Try persisting to Neon PostgreSQL
         if db.get_connection_url():
@@ -541,10 +542,13 @@ def upload_transcript_endpoint():
     else:
         _mem_store["transcripts"][tx_id] = tx_record
 
+    meeting_date = data.get("optionalDate") or ai.extract_meeting_date(text)
+
     # Launch Gemini processing in background thread
     threading.Thread(
         target=process_transcript_async,
         args=(tx_id, text, title),
+        kwargs={"meeting_date": meeting_date},
         daemon=True
     ).start()
 
@@ -562,6 +566,8 @@ def get_transcript_endpoint(tx_id):
             record = db.get_transcript_by_id(tx_id, user_id=user_id, is_admin=is_admin)
             if record:
                 if record.get("_forbidden"):
+                    if not user_id:
+                        return jsonify({"error": "Unauthorized. Please log in to view this transcript."}), 401
                     return jsonify({"error": "Access denied. You do not have permission to view this transcript."}), 403
                 return jsonify(record), 200
         except Exception as e:
@@ -595,9 +601,11 @@ def retry_transcript_endpoint(tx_id):
     if not tx_text:
         return jsonify({"error": "Transcript not found."}), 404
 
+    meeting_date = ai.extract_meeting_date(tx_text)
     threading.Thread(
         target=process_transcript_async,
         args=(tx_id, tx_text, tx_title),
+        kwargs={"meeting_date": meeting_date},
         daemon=True
     ).start()
 
@@ -641,13 +649,30 @@ def _sync_action_item_to_trello(action_id, status=None, title=None, desc=None):
     threading.Thread(target=_worker, daemon=True).start()
 
 @app.route("/api/action-items/<action_id>/approve", methods=["POST"])
+@require_auth
 def approve_action_item_endpoint(action_id):
     """Approve action item (human-in-the-loop task governance) with audit logging."""
-    user = get_current_user()
-    approver_id = user["id"] if user else None
-    approver_name = user.get("name") if user else "Authorized Reviewer"
+    user = request.current_user
+    approver_id = user["id"]
+    approver_name = user.get("name", "Authorized Reviewer")
 
     if db.get_connection_url():
+        # Permission check: admin, team_lead, or transcript owner/assignee
+        with db.get_db_cursor(commit=False) as cur:
+            cur.execute("""
+                SELECT a.id, a.transcript_id, a.assignee_id, t.user_id as transcript_owner
+                FROM action_items a
+                LEFT JOIN transcripts t ON a.transcript_id = t.id
+                WHERE a.id = %s;
+            """, (action_id,))
+            item = cur.fetchone()
+        if not item:
+            return jsonify({"error": "Action item not found."}), 404
+        is_privileged = user.get("role") in ("admin", "team_lead")
+        is_owner = (item.get("transcript_owner") == user["id"]) or (item.get("assignee_id") == user["id"])
+        if item.get("transcript_owner") is not None and not is_privileged and not is_owner:
+            return jsonify({"error": "Forbidden. You do not have permission to review this task."}), 403
+
         success = db.update_action_item_status(action_id, "Approved", approver_id=approver_id)
         if success:
             _sync_action_item_to_trello(action_id, status="Approved")
@@ -664,6 +689,7 @@ def approve_action_item_endpoint(action_id):
     return jsonify({"error": "Action item not found."}), 404
 
 @app.route("/api/action-items/bulk-approve", methods=["POST"])
+@require_auth
 def bulk_approve_action_items_endpoint():
     """Bulk approve multiple eligible action items with reviewer audit trail."""
     data = request.get_json(silent=True) or {}
@@ -671,9 +697,9 @@ def bulk_approve_action_items_endpoint():
     if not action_ids:
         return jsonify({"error": "actionIds list is required."}), 400
 
-    user = get_current_user()
-    approver_id = user["id"] if user else None
-    approver_name = user.get("name") if user else "Authorized Reviewer"
+    user = request.current_user
+    approver_id = user["id"]
+    approver_name = user.get("name", "Authorized Reviewer")
 
     if db.get_connection_url():
         approved_count = db.bulk_approve_action_items(action_ids, approver_id=approver_id)
@@ -736,9 +762,26 @@ def export_action_items_endpoint():
     )
 
 @app.route("/api/action-items/<action_id>/reject", methods=["POST"])
+@require_auth
 def reject_action_item_endpoint(action_id):
     """Reject action item."""
+    user = request.current_user
     if db.get_connection_url():
+        with db.get_db_cursor(commit=False) as cur:
+            cur.execute("""
+                SELECT a.id, a.transcript_id, a.assignee_id, t.user_id as transcript_owner
+                FROM action_items a
+                LEFT JOIN transcripts t ON a.transcript_id = t.id
+                WHERE a.id = %s;
+            """, (action_id,))
+            item = cur.fetchone()
+        if not item:
+            return jsonify({"error": "Action item not found."}), 404
+        is_privileged = user.get("role") in ("admin", "team_lead")
+        is_owner = (item.get("transcript_owner") == user["id"]) or (item.get("assignee_id") == user["id"])
+        if item.get("transcript_owner") is not None and not is_privileged and not is_owner:
+            return jsonify({"error": "Forbidden. You do not have permission to review this task."}), 403
+
         success = db.update_action_item_status(action_id, "Rejected")
         if success:
             _sync_action_item_to_trello(action_id, status="Rejected")
@@ -754,10 +797,27 @@ def reject_action_item_endpoint(action_id):
     return jsonify({"error": "Action item not found."}), 404
 
 @app.route("/api/action-items/<action_id>", methods=["PUT"])
+@require_auth
 def edit_action_item_endpoint(action_id):
     """Edit action item details."""
+    user = request.current_user
     updates = request.get_json(silent=True) or {}
     if db.get_connection_url():
+        with db.get_db_cursor(commit=False) as cur:
+            cur.execute("""
+                SELECT a.id, a.transcript_id, a.assignee_id, t.user_id as transcript_owner
+                FROM action_items a
+                LEFT JOIN transcripts t ON a.transcript_id = t.id
+                WHERE a.id = %s;
+            """, (action_id,))
+            item = cur.fetchone()
+        if not item:
+            return jsonify({"error": "Action item not found."}), 404
+        is_privileged = user.get("role") in ("admin", "team_lead")
+        is_owner = (item.get("transcript_owner") == user["id"]) or (item.get("assignee_id") == user["id"])
+        if item.get("transcript_owner") is not None and not is_privileged and not is_owner:
+            return jsonify({"error": "Forbidden. You do not have permission to edit this task."}), 403
+
         success = db.edit_action_item(action_id, updates)
         if success:
             _sync_action_item_to_trello(
@@ -909,6 +969,7 @@ def trello_status_endpoint():
     }), 200
 
 @app.route("/api/trello/connect", methods=["POST"])
+@require_auth
 def trello_connect_endpoint():
     """Verify user Trello token, save in database and .env, and initialize board."""
     data = request.get_json(silent=True) or {}
@@ -948,9 +1009,9 @@ def trello_connect_endpoint():
         return jsonify({"error": f"Token is valid, but failed to setup board: {e}"}), 500
 
     # Run initial sync in background
-    user = get_current_user()
-    user_id = user["id"] if user else None
-    is_admin = (user.get("role") == "admin") if user else False
+    user = request.current_user
+    user_id = user["id"]
+    is_admin = (user.get("role") == "admin")
     threading.Thread(target=trello_service.sync_all, args=(user_id, is_admin), daemon=True).start()
 
     return jsonify({
@@ -961,6 +1022,7 @@ def trello_connect_endpoint():
     }), 200
 
 @app.route("/api/trello/disconnect", methods=["POST"])
+@require_auth
 def trello_disconnect_endpoint():
     """Disconnect Trello token and reset integration."""
     db.save_trello_setting("token", "")

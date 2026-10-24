@@ -11,7 +11,6 @@ import {
   Scale
 } from 'lucide-react'
 import { api } from '../services/api.js'
-import { transcriptStore } from '../services/transcriptStore.js'
 
 export default function Summaries() {
   const nav = useNavigate()
@@ -24,13 +23,10 @@ export default function Summaries() {
     setLoading(true)
     try {
       const list = await api.listTranscripts()
-      if (Array.isArray(list)) {
-        setTranscripts(list)
-      } else {
-        setTranscripts(transcriptStore.getTranscripts())
-      }
-    } catch {
-      setTranscripts(transcriptStore.getTranscripts())
+      setTranscripts(Array.isArray(list) ? list : [])
+    } catch (err) {
+      console.error('Failed to load summaries:', err)
+      setTranscripts([])
     } finally {
       setLoading(false)
     }

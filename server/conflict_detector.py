@@ -105,11 +105,14 @@ def detect_duplicates_and_conflicts(
 
             # Conflict B: Contradictory due dates for the same commitment/feature
             if sim >= 0.65 and deadline and other_deadline:
-                if deadline != "Unspecified" and other_deadline != "Unspecified" and deadline != other_deadline:
-                    is_conf = True
-                    conf_warnings.append(
-                        f"Contradictory deadlines: '{deadline}' vs '{other_deadline}' in task '{other_title}'"
-                    )
+                if deadline != "Unspecified" and other_deadline != "Unspecified":
+                    d_day = deadline.split()[0]
+                    o_day = other_deadline.split()[0]
+                    if d_day != o_day:
+                        is_conf = True
+                        conf_warnings.append(
+                            f"Contradictory deadlines: '{deadline}' vs '{other_deadline}' in task '{other_title}'"
+                        )
 
             # Conflict C: Same owner assigned multiple high-priority tasks on identical tight deadline
             if owner and other_owner and owner == other_owner and owner not in ("unassigned", ""):

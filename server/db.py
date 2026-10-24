@@ -357,6 +357,7 @@ def init_schema():
         bootstrap_admin_from_env_if_set()
         seed_team_lead_and_teams()
         seed_hacknova_team_users()
+        seed_demo_sprint_users()
         return True
     except Exception as e:
         logger.error(f"Failed to initialize schema in PostgreSQL: {e}")
@@ -425,9 +426,10 @@ def get_transcript_by_id(transcript_id, user_id=None, is_admin=False):
         if not tx:
             return None
         
-        # Access control: if transcript belongs to a user and caller is another user (and not admin)
-        if tx.get('userId') is not None and user_id is not None and tx.get('userId') != user_id and not is_admin:
-            return {"_forbidden": True}
+        # Access control: if transcript belongs to a user, enforce ownership unless admin
+        if tx.get('userId') is not None:
+            if not user_id or (tx.get('userId') != user_id and not is_admin):
+                return {"_forbidden": True}
         
         result = dict(tx)
 
@@ -464,11 +466,25 @@ def get_transcript_by_id(transcript_id, user_id=None, is_admin=False):
 
         # Action Items
         cur.execute("""
-            SELECT id, title, description, owner, owner_status as "ownerStatus",
-                   deadline, deadline_status as "deadlineStatus", priority, status,
-                   evidence_speaker, evidence_timestamp, evidence_quote
-            FROM action_items
-            WHERE transcript_id = %s;
+            SELECT a.id, a.title, a.description,
+                   COALESCE(a.item_type, 'commitment') as "itemType",
+                   a.owner, a.owner_status as "ownerStatus",
+                   a.assignee_id as "assigneeId",
+                   a.deadline, a.deadline_status as "deadlineStatus", a.priority, a.status,
+                   COALESCE(a.is_duplicate, FALSE) as "isDuplicate",
+                   a.duplicate_warning as "duplicateWarning",
+                   a.duplicate_of as "duplicateOf",
+                   COALESCE(a.is_conflict, FALSE) as "isConflict",
+                   a.conflict_warning as "conflictWarning",
+                   COALESCE(a.confidence_score, 0.90) as "confidenceScore",
+                   a.trello_card_id as "trelloCardId",
+                   a.trello_card_url as "trelloCardUrl",
+                   a.approved_by as "approvedBy",
+                   to_char(a.approved_at, 'Mon DD, YYYY HH12:MI AM') as "approvedAt",
+                   a.evidence_speaker, a.evidence_timestamp, a.evidence_quote
+            FROM action_items a
+            WHERE a.transcript_id = %s
+            ORDER BY a.created_at ASC;
         """, (transcript_id,))
         act_rows = cur.fetchall()
         result['actionItems'] = [
@@ -476,12 +492,24 @@ def get_transcript_by_id(transcript_id, user_id=None, is_admin=False):
                 "id": r['id'],
                 "title": r['title'],
                 "description": r['description'],
+                "itemType": r['itemType'],
                 "owner": r['owner'],
                 "ownerStatus": r['ownerStatus'],
+                "assigneeId": r['assigneeId'],
                 "deadline": r['deadline'],
                 "deadlineStatus": r['deadlineStatus'],
                 "priority": r['priority'],
                 "status": r['status'],
+                "isDuplicate": r['isDuplicate'],
+                "duplicateWarning": r['duplicateWarning'],
+                "duplicateOf": r['duplicateOf'],
+                "isConflict": r['isConflict'],
+                "conflictWarning": r['conflictWarning'],
+                "confidenceScore": float(r['confidenceScore']) if r['confidenceScore'] is not None else 0.90,
+                "trelloCardId": r['trelloCardId'],
+                "trelloCardUrl": r['trelloCardUrl'],
+                "approvedBy": r['approvedBy'],
+                "approvedAt": r['approvedAt'],
                 "evidence": {
                     "speaker": r['evidence_speaker'],
                     "timestamp": r['evidence_timestamp'],
@@ -525,7 +553,15 @@ def insert_transcript(tx_data, user_id=None):
                 status, duration, participants, raw_text, user_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            ) RETURNING id;
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                raw_text = EXCLUDED.raw_text,
+                status = EXCLUDED.status,
+                user_id = EXCLUDED.user_id,
+                duration = EXCLUDED.duration,
+                participants = EXCLUDED.participants
+            RETURNING id;
         """, (
             tx_data['id'],
             tx_data['title'],
@@ -540,6 +576,22 @@ def insert_transcript(tx_data, user_id=None):
             user_id
         ))
         return tx_data['id']
+
+def create_transcript(transcript_id, title, raw_text, source="text", status="Processing", user_id=None, meeting_date=None, **kwargs):
+    """Convenience helper to insert a transcript record into the database."""
+    tx_data = {
+        "id": transcript_id,
+        "title": title,
+        "text": raw_text,
+        "sourceType": source,
+        "status": status,
+        "filename": kwargs.get("filename", f"{transcript_id}.txt"),
+        "fileSize": kwargs.get("fileSize", len(raw_text.encode('utf-8'))),
+        "fileType": kwargs.get("fileType", "TXT"),
+        "duration": kwargs.get("duration", "Calculating..."),
+        "participants": kwargs.get("participants", [])
+    }
+    return insert_transcript(tx_data, user_id=user_id)
 
 def save_analysis_results(transcript_id, analysis_data):
     """Persist structured AI analysis output into relational tables."""
@@ -579,13 +631,15 @@ def save_analysis_results(transcript_id, analysis_data):
         # 3. Clean and insert decisions
         cur.execute("DELETE FROM decisions WHERE transcript_id = %s;", (transcript_id,))
         decisions = analysis_data.get('decisions', [])
-        for d in decisions:
+        for idx, d in enumerate(decisions):
             ev = d.get('evidence') or {}
+            raw_id = d.get('id') or f"dec-{idx + 1}"
+            dec_id = raw_id if raw_id.startswith(f"dec-{transcript_id}") else f"dec-{transcript_id}-{idx + 1}-{os.urandom(3).hex()}"
             cur.execute("""
                 INSERT INTO decisions (id, transcript_id, title, details, evidence_speaker, evidence_timestamp, evidence_quote)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
             """, (
-                d.get('id') or f"dec-{transcript_id}-{os.urandom(4).hex()}",
+                dec_id,
                 transcript_id,
                 d.get('title', ''),
                 d.get('details', ''),
@@ -629,8 +683,10 @@ def save_analysis_results(transcript_id, analysis_data):
             decisions=analysis_data.get('decisions', [])
         )
 
-        for a in annotated_items:
+        for idx, a in enumerate(annotated_items):
             ev = a.get('evidence') or {}
+            raw_act_id = a.get('id') or f"act-{idx + 1}"
+            act_id = raw_act_id if raw_act_id.startswith(f"act-{transcript_id}") else f"act-{transcript_id}-{idx + 1}-{os.urandom(3).hex()}"
             cur.execute("""
                 INSERT INTO action_items (
                     id, transcript_id, title, description, item_type, owner, owner_status,
@@ -648,7 +704,7 @@ def save_analysis_results(transcript_id, analysis_data):
                     %s, %s, %s
                 );
             """, (
-                a.get('id') or f"act-{transcript_id}-{os.urandom(4).hex()}",
+                act_id,
                 transcript_id,
                 a.get('title', ''),
                 a.get('description', ''),
@@ -676,14 +732,16 @@ def save_analysis_results(transcript_id, analysis_data):
         # 5. Clean and insert unresolved questions
         cur.execute("DELETE FROM unresolved_questions WHERE transcript_id = %s;", (transcript_id,))
         unresolved = analysis_data.get('unresolvedQuestions', [])
-        for u in unresolved:
+        for idx, u in enumerate(unresolved):
+            raw_unres_id = u.get('id') or f"unres-{idx + 1}"
+            unres_id = raw_unres_id if raw_unres_id.startswith(f"unres-{transcript_id}") else f"unres-{transcript_id}-{idx + 1}-{os.urandom(3).hex()}"
             cur.execute("""
                 INSERT INTO unresolved_questions (
                     id, transcript_id, title, category, description, evidence, status, assigned_owner_id, target_deadline
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
-                u.get('id') or f"unres-{transcript_id}-{os.urandom(4).hex()}",
+                unres_id,
                 transcript_id,
                 u.get('title', ''),
                 u.get('category', 'Unanswered Question'),
@@ -1233,6 +1291,57 @@ def seed_hacknova_team_users():
             return seeded
     except Exception as e:
         logger.error(f"Error seeding HACKNOVA team users: {e}")
+        return []
+
+def seed_demo_sprint_users():
+    """
+    Safely and idempotently seed the demo sprint planning team members into Neon PostgreSQL:
+    1. Aditi Sharma (Team Lead)
+    2. Rahul Patil (Backend Developer)
+    3. Neha Kulkarni (Frontend Developer)
+    4. Arjun Deshmukh (QA Engineer)
+    Preserves all existing users, foreign keys, and history.
+    """
+    if not get_connection_url():
+        return []
+
+    sprint_members = [
+        {"name": "Aditi Sharma", "email": "aditi@commitflow.dev", "role": "team_lead"},
+        {"name": "Rahul Patil", "email": "rahul@commitflow.dev", "role": "user"},
+        {"name": "Neha Kulkarni", "email": "neha@commitflow.dev", "role": "user"},
+        {"name": "Arjun Deshmukh", "email": "arjun@commitflow.dev", "role": "user"}
+    ]
+
+    seeded = []
+    default_pwd_hash = generate_password_hash("Sprint@2026!")
+
+    try:
+        with get_db_cursor(commit=True) as cur:
+            for m in sprint_members:
+                cur.execute("""
+                    SELECT id, name, email, role FROM users 
+                    WHERE LOWER(name) = LOWER(%s) OR LOWER(email) = LOWER(%s);
+                """, (m["name"], m["email"]))
+                existing = cur.fetchone()
+
+                if existing:
+                    u_id = existing["id"]
+                    cur.execute("UPDATE users SET name = %s WHERE id = %s;", (m["name"], u_id))
+                    seeded.append({"id": u_id, "name": m["name"], "email": existing["email"], "role": existing["role"], "action": "existing"})
+                else:
+                    u_id = f"usr-{uuid.uuid4().hex[:12]}"
+                    cur.execute("""
+                        INSERT INTO users (id, name, email, password_hash, role, status)
+                        VALUES (%s, %s, %s, %s, %s, 'active')
+                        RETURNING id, name, email, role;
+                    """, (u_id, m["name"], m["email"], default_pwd_hash, m["role"]))
+                    row = cur.fetchone()
+                    seeded.append({"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "action": "created"})
+
+            logger.info(f"Sprint team seeding complete: {[s['name'] for s in seeded]}")
+            return seeded
+    except Exception as e:
+        logger.error(f"Error seeding sprint team users: {e}")
         return []
 
 def create_user(name, email, password, role="user"):

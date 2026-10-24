@@ -17,7 +17,6 @@ import {
 } from 'lucide-react'
 import Modal from '../components/Modal.jsx'
 import { api } from '../services/api.js'
-import { transcriptStore } from '../services/transcriptStore.js'
 
 export default function Transcripts() {
   const nav = useNavigate()
@@ -50,8 +49,9 @@ export default function Transcripts() {
       ])
       if (Array.isArray(list)) setTranscripts(list)
       if (h) setHealth(h)
-    } catch {
-      setTranscripts(transcriptStore.getTranscripts())
+    } catch (err) {
+      console.error('Failed to load transcripts from server:', err)
+      setTranscripts([])
     } finally {
       setLoading(false)
     }
@@ -117,8 +117,8 @@ export default function Transcripts() {
       }
       reader.readAsText(file)
     } else {
-      // For DOCX / PDF
-      setPastedText(`[00:01:00] Meeting Chair: Reviewing uploaded document: ${file.name}\n[00:05:00] Participant: Key action items and outcomes will be extracted from this document.\n[00:10:00] Lead: We confirm proceeding with the project timeline.`)
+      setFileError(`To ensure 100% grounded extraction accuracy, please upload a .txt, .vtt, or .srt file, or paste your transcript dialogue below.`)
+      setSelectedFile(null)
     }
   }
 
@@ -137,8 +137,8 @@ export default function Transcripts() {
       return
     }
 
-    if (!selectedFile && !pastedText.trim()) {
-      setFileError('Please select a transcript file or paste dialogue text.')
+    if (!pastedText.trim()) {
+      setFileError('Please provide transcript dialogue text.')
       return
     }
 
@@ -154,11 +154,11 @@ export default function Transcripts() {
         : 'TXT'
 
       const newTx = await api.uploadTranscript({
-        title: formTitle,
+        title: formTitle.trim(),
         filename: selectedFile ? selectedFile.name : `${formTitle.toLowerCase().replace(/[^a-z0-9]/g, '_')}.txt`,
         fileSize: fileSizeFormatted,
         fileType,
-        text: pastedText || `[00:00:15] Meeting Chair: Discussing ${formTitle}.\n[00:05:00] Participant: Committing to the follow-up tasks.`,
+        text: pastedText.trim(),
         optionalDate: formDate ? new Date(formDate).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : undefined,
         optionalParticipants: formParticipants
       })

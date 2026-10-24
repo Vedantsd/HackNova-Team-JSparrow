@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { Routes, Route, Navigate, useLocation, useParams } from 'react-router-dom'
 import { useAuth } from './context/AuthContext.jsx'
 import Layout from './components/Layout.jsx'
 import AdminLayout from './components/AdminLayout.jsx'
@@ -146,6 +146,11 @@ function RootRedirect() {
   return <Navigate to={getRoleHome(user.role)} replace />
 }
 
+function TranscriptAnalysisRedirect() {
+  const { id } = useParams()
+  return <Navigate to={`/user/transcripts/${id}/analysis`} replace />
+}
+
 // -------------------------------------------------------------
 // App Routing Configuration
 // -------------------------------------------------------------
@@ -228,7 +233,7 @@ export default function App() {
       <Route path="/meetings" element={<Navigate to="/user/meetings" replace />} />
       <Route path="/calendar" element={<Navigate to="/user/calendar" replace />} />
       <Route path="/transcripts" element={<Navigate to="/user/transcripts" replace />} />
-      <Route path="/transcripts/:id/analysis" element={<Navigate to="/user/transcripts" replace />} />
+      <Route path="/transcripts/:id/analysis" element={<TranscriptAnalysisRedirect />} />
       <Route path="/summaries" element={<Navigate to="/user/analysis" replace />} />
       <Route path="/actions" element={<Navigate to="/user/action-items" replace />} />
       <Route path="/settings" element={<Navigate to="/user/profile" replace />} />

@@ -75,7 +75,7 @@ class TranscriptAnalysisResult(BaseModel):
 
 def get_gemini_config():
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
     return api_key, model
 
 def check_gemini_status():
@@ -84,23 +84,29 @@ def check_gemini_status():
         return False, "GEMINI_API_KEY is not configured in .env."
     return True, f"Configured with model: {model}"
 
-def build_prompt(transcript_text: str, meeting_title: str) -> str:
+def build_prompt(transcript_text: str, meeting_title: str, meeting_date: Optional[str] = None) -> str:
+    date_context = f"\nMeeting Date Context: {meeting_date}" if meeting_date else ""
     return f"""You are CommitFlow's Meeting-to-Execution Automation AI.
-Analyze the following meeting transcript for "{meeting_title}".
+Analyze the following meeting transcript for "{meeting_title}".{date_context}
 
-CRITICAL INSTRUCTIONS:
-1. Ground Truth Only: Never invent an owner, deadline, decision, or statement that is not explicitly supported by the transcript.
-2. Strict Classification Mechanism:
-   - "commitment": A concrete deliverable or action someone explicitly agreed or was assigned to perform (e.g. "Swapnil will implement notifications by November 5").
-   - "suggestion": A proposed idea, suggestion, or recommendation that has not necessarily been approved or accepted (e.g. "We could add notifications next month").
-   - "unresolved_question": An issue or topic requiring clarification or a future decision.
-3. Keep Decisions Distinct: Extracted Decisions represent confirmed architectural, product, or organizational choices. Do not confuse decisions with action items.
-4. Handle Missing Details:
-   - If an owner is not clearly identified or is vague (e.g. "someone on QA should...", "the team will..."), set owner="Unassigned" and ownerStatus="ambiguous".
-   - If a deadline is not explicitly stated or unambiguously inferable, set deadline="Unspecified" and deadlineStatus="missing".
-5. Action Items: All newly extracted items must have status="Pending Approval" so human reviewers can review and approve them.
-6. Traceable Evidence: For each decision and action item, include verbatim quote, speaker name, and timestamp if available in text.
-7. Unresolved Questions: Explicitly identify missing owners, ambiguous deadlines, conflicting instructions, and unanswered questions.
+CRITICAL GROUND-TRUTH INSTRUCTIONS:
+1. Ground Truth Only: Never invent an owner, deadline, decision, commitment, or statement that is not explicitly supported by the transcript text.
+2. Strict Deliverable Classification:
+   - "commitment": A concrete deliverable or action someone explicitly agreed, was assigned, or committed to perform (e.g. "Rahul will complete authentication API by Thursday, 22 October at 5 PM", "I can complete the API...").
+   - "suggestion": A proposed idea, suggestion, or recommendation that has not been approved or accepted (e.g. dark mode in a future sprint, adding a notification panel). Must NOT be converted into approved sprint tasks.
+   - "unresolved_question": An open question, clarification item, dependency, or potential integration risk.
+3. Keep Decisions Distinct: Extracted Decisions represent confirmed architectural, product, or organizational choices explicitly agreed upon in the meeting. Do not confuse decisions with action items or suggestions. Only include decisions that were explicitly agreed upon or confirmed by the participants. Do not include ideas, suggestions, or proposals that were merely mentioned or discussed without explicit agreement. If no confirmed decisions were made in the meeting, return an empty array [] for decisions.
+4. Handle Missing Details Faithfully:
+   - If an owner is not clearly identified, is unassigned, or belongs to a suggestion (e.g. "No one is assigned to that yet", "someone..."), set owner="Unassigned" and ownerStatus="ambiguous".
+   - If a deadline is not explicitly stated or agreed, set deadline="Unspecified" and deadlineStatus="missing".
+5. Date Interpretation & Resolution:
+   - Resolve all relative dates (e.g. "by Thursday, 22 October at 5 PM", "Wednesday, 21 October at 2 PM", "by Friday at 3 PM") relative to the meeting date ({meeting_date or 'stated meeting date'}) into ISO format: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM".
+   - Validate dates consistently with the meeting timeline.
+6. Traceable Evidence: For each decision, action item, and suggestion, include the verbatim quote, speaker name, and timestamp if present in text.
+7. Dependencies and Potential Integration Risks:
+   - Accurately capture dependencies and potential integration risks (e.g. API response format change risk) under unresolvedQuestions.
+   - Distinguish potential risks or dependencies from confirmed conflicts.
+8. Status: All extracted items must default to status="Pending Approval" so human reviewers can govern them.
 
 Transcript Content:
 \"\"\"
@@ -132,7 +138,7 @@ Return a valid JSON object matching this exact structure:
       "itemType": "commitment" or "suggestion" or "unresolved_question",
       "owner": "Person Name or Unassigned",
       "ownerStatus": "confirmed" or "ambiguous",
-      "deadline": "YYYY-MM-DD or timeframe or Unspecified",
+      "deadline": "YYYY-MM-DD or YYYY-MM-DD HH:MM or Unspecified",
       "deadlineStatus": "confirmed" or "missing",
       "priority": "High" or "Medium" or "Low",
       "status": "Pending Approval",
@@ -148,9 +154,9 @@ Return a valid JSON object matching this exact structure:
   ],
   "unresolvedQuestions": [
     {{
-      "title": "Short title of the unresolved question",
+      "title": "Short title of the unresolved question or risk",
       "category": "Missing Owner" or "Missing Deadline" or "Conflicting Commitments" or "Unanswered Question",
-      "description": "Explanation of the ambiguity or conflict",
+      "description": "Explanation of the ambiguity, dependency, or risk",
       "evidence": "Quote showing where the ambiguity arose"
     }}
   ],
@@ -158,27 +164,37 @@ Return a valid JSON object matching this exact structure:
 }}
 """
 
-def analyze_transcript(transcript_text: str, meeting_title: str) -> dict:
+def extract_meeting_date(transcript_text: str) -> Optional[str]:
+    """Helper to detect stated meeting date from transcript header if present."""
+    m = re.search(r"(?:Date|Meeting Date):\s*([^\n\r]+)", transcript_text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def analyze_transcript(transcript_text: str, meeting_title: str = "CommitFlow Meeting", meeting_date: Optional[str] = None) -> dict:
     """
     Analyzes meeting transcript using Google Gemini API.
-    Falls back gracefully to heuristic rule-based extraction if GEMINI_API_KEY is not configured.
+    Raises RuntimeError on failure or missing credentials to prevent fabricated mock fallbacks.
     """
     api_key, model_name = get_gemini_config()
 
     if not api_key:
-        logger.warning("GEMINI_API_KEY not configured. Falling back to local rule-based analysis engine.")
-        return fallback_heuristic_analysis(transcript_text, meeting_title, reason="GEMINI_API_KEY is not set in .env")
+        logger.error("GEMINI_API_KEY is not configured in .env.")
+        raise ValueError("GEMINI_API_KEY is not configured in .env. Please configure your Gemini API key.")
+
+    if not meeting_date:
+        meeting_date = extract_meeting_date(transcript_text)
 
     try:
         from google import genai
         from google.genai import types
 
         client = genai.Client(api_key=api_key)
-        prompt = build_prompt(transcript_text, meeting_title)
+        prompt = build_prompt(transcript_text, meeting_title, meeting_date=meeting_date)
 
-        # Candidate models with graceful fallback if the chosen model is sunset or overloaded
+        # Candidate models with fast, working fallbacks
         candidates = [model_name]
-        for fb in ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"]:
+        for fb in ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"]:
             if fb not in candidates:
                 candidates.append(fb)
 
@@ -194,7 +210,8 @@ def analyze_transcript(transcript_text: str, meeting_title: str) -> dict:
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
-                        temperature=0.2
+                        response_schema=TranscriptAnalysisResult,
+                        temperature=0.1
                     )
                 )
                 if response and response.text:
@@ -205,18 +222,10 @@ def analyze_transcript(transcript_text: str, meeting_title: str) -> dict:
                 logger.warning(f"Gemini model '{cand}' attempt failed ({m_err}). Trying fallback candidate...")
 
         if not response or not response.text:
-            raise last_err or Exception("All Gemini candidate models failed to return content.")
+            raise last_err or RuntimeError("All Gemini candidate models failed to return content.")
 
         response_text = response.text.strip()
-        # Clean markdown wrappers if model enclosed JSON in ```json ... ```
-        if response_text.startswith("```"):
-            response_text = re.sub(r"^```(?:json)?\s*", "", response_text)
-            response_text = re.sub(r"\s*```$", "", response_text)
-
-        raw_json = json.loads(response_text)
-        
-        # Validate against Pydantic schema
-        validated = TranscriptAnalysisResult.model_validate(raw_json)
+        validated = TranscriptAnalysisResult.model_validate_json(response_text)
         result_dict = validated.model_dump()
         result_dict["aiEngine"] = f"Google Gemini ({used_model})"
         
@@ -228,8 +237,7 @@ def analyze_transcript(transcript_text: str, meeting_title: str) -> dict:
 
     except Exception as e:
         logger.error(f"Gemini API request failed: {e}")
-        # Return fallback with error clarification
-        return fallback_heuristic_analysis(transcript_text, meeting_title, reason=f"Gemini API call failed: {str(e)}")
+        raise RuntimeError(f"Gemini API processing failed: {str(e)}")
 
 # -------------------------------------------------------------
 # Heuristic Fallback Analysis (when API key is not yet set)
@@ -279,17 +287,6 @@ def fallback_heuristic_analysis(text: str, title: str, reason: str = "") -> dict
             if len(decisions) >= 3:
                 break
 
-    if not decisions:
-        decisions.append({
-            "id": "dec-default",
-            "title": f"Consensus on {title} execution roadmap",
-            "details": "The team agreed on the general timeline and implementation approach discussed.",
-            "evidence": {
-                "speaker": participants[0],
-                "timestamp": "00:05",
-                "quote": lines[0][:150] if lines else f"Consensus reached for {title}."
-            }
-        })
 
     action_items = []
     for idx, l in enumerate(lines):

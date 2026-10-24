@@ -209,19 +209,27 @@ export default function FollowUps({ isTeamLead = false }) {
   const analysisBase = isTeamLead ? '/team-lead/transcripts' : '/user/transcripts'
 
   return (
-    <div className="stack" style={{ gap: '20px' }}>
-      {/* Top Banner / Header */}
-      <section className="panel">
-        <div className="phead" style={{ flexWrap: 'wrap', gap: '12px', alignItems: 'center' }}>
+    <div className="followups-container">
+      {/* Top Banner / Header with Interactive Stat Cards */}
+      <section className="followups-header-card">
+        <div className="followups-header-content">
           <div>
-            <div className="row" style={{ gap: '8px', alignItems: 'center' }}>
-              <HelpCircle size={22} color="var(--color-primary)" />
-              <h2>Follow-ups & Unresolved Questions</h2>
-              <span className="badge">{counts.pending} pending</span>
+            <div className="followups-title-row">
+              <div className="followups-title-icon-wrap">
+                <HelpCircle size={22} />
+              </div>
+              <div>
+                <div className="row" style={{ gap: '10px', alignItems: 'center' }}>
+                  <h2 className="followups-title">Follow-ups & Unresolved Questions</h2>
+                  <span className="followups-badge">
+                    <Clock size={12} /> {counts.pending} pending action
+                  </span>
+                </div>
+                <p className="followups-subtitle">
+                  Real-world repository of open questions, ambiguous commitments, and follow-up deliverables identified from meeting discussions.
+                </p>
+              </div>
             </div>
-            <p className="muted sm" style={{ marginTop: '4px' }}>
-              Real-world repository of open questions, ambiguous commitments, and follow-up deliverables identified from meeting discussions.
-            </p>
           </div>
 
           <div className="row" style={{ gap: '8px' }}>
@@ -234,314 +242,355 @@ export default function FollowUps({ isTeamLead = false }) {
           </div>
         </div>
 
-        {/* Tab Selection & Search Bar */}
-        <div className="pbody" style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px' }}>
-          <div className="between" style={{ flexWrap: 'wrap', gap: '12px' }}>
-            {/* Tabs */}
-            <div className="row" style={{ gap: '8px', flexWrap: 'wrap' }}>
-              <button
-                className={'chip' + (activeTab === 'all' ? ' on' : '')}
-                onClick={() => setActiveTab('all')}
-              >
-                All ({counts.total})
-              </button>
-              <button
-                className={'chip' + (activeTab === 'pending' ? ' on' : '')}
-                onClick={() => setActiveTab('pending')}
-              >
-                Pending ({counts.pending})
-              </button>
-              <button
-                className={'chip' + (activeTab === 'clarification' ? ' on' : '')}
-                onClick={() => setActiveTab('clarification')}
-              >
-                Needs Clarification ({counts.clarification})
-              </button>
-              <button
-                className={'chip' + (activeTab === 'resolved' ? ' on' : '')}
-                onClick={() => setActiveTab('resolved')}
-              >
-                Resolved History ({counts.resolved})
-              </button>
+        {/* Quick-Filter Metric Stat Cards */}
+        <div className="followups-stats-grid">
+          <div
+            className={`followup-stat-card ${activeTab === 'all' ? 'active' : ''}`}
+            onClick={() => setActiveTab('all')}
+            title="View all follow-up items"
+          >
+            <div className="followup-stat-icon total">
+              <FileText size={18} />
             </div>
+            <div>
+              <div className="followup-stat-val">{counts.total}</div>
+              <div className="followup-stat-label">Total Questions</div>
+            </div>
+          </div>
 
-            {/* Search Input */}
-            <div style={{ position: 'relative', minWidth: '220px' }}>
-              <Search size={14} style={{ position: 'absolute', left: '10px', top: '10px', color: 'var(--color-muted)' }} />
-              <input
-                type="text"
-                className="input sm"
-                placeholder="Search follow-ups..."
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                style={{ paddingLeft: '30px', width: '100%' }}
-              />
+          <div
+            className={`followup-stat-card ${activeTab === 'pending' ? 'active' : ''}`}
+            onClick={() => setActiveTab('pending')}
+            title="View pending items awaiting response"
+          >
+            <div className="followup-stat-icon pending">
+              <Clock size={18} />
+            </div>
+            <div>
+              <div className="followup-stat-val">{counts.pending}</div>
+              <div className="followup-stat-label">Pending Review</div>
+            </div>
+          </div>
+
+          <div
+            className={`followup-stat-card ${activeTab === 'clarification' ? 'active' : ''}`}
+            onClick={() => setActiveTab('clarification')}
+            title="View items needing owner or deadline clarification"
+          >
+            <div className="followup-stat-icon alert">
+              <AlertCircle size={18} />
+            </div>
+            <div>
+              <div className="followup-stat-val">{counts.clarification}</div>
+              <div className="followup-stat-label">Needs Clarification</div>
+            </div>
+          </div>
+
+          <div
+            className={`followup-stat-card ${activeTab === 'resolved' ? 'active' : ''}`}
+            onClick={() => setActiveTab('resolved')}
+            title="View resolved history items"
+          >
+            <div className="followup-stat-icon resolved">
+              <CheckCircle2 size={18} />
+            </div>
+            <div>
+              <div className="followup-stat-val">{counts.resolved}</div>
+              <div className="followup-stat-label">Resolved History</div>
             </div>
           </div>
         </div>
       </section>
 
-      {/* Main Content Area */}
-      <section className="panel">
-        <div className="pbody">
-          {loading ? (
-            <div style={{ textAlign: 'center', padding: '48px 16px' }}>
-              <Loader2 size={24} className="spin-icon" style={{ margin: '0 auto 12px' }} />
-              <p className="muted">Loading real persisted follow-up items...</p>
+      {/* Toolbar: Navigation Tabs & Search Input */}
+      <section className="followups-toolbar">
+        <div className="followups-nav-tabs">
+          <button
+            className={`followups-tab-btn ${activeTab === 'all' ? 'active' : ''}`}
+            onClick={() => setActiveTab('all')}
+          >
+            All Items
+            <span className="followups-tab-count">{counts.total}</span>
+          </button>
+          <button
+            className={`followups-tab-btn ${activeTab === 'pending' ? 'active' : ''}`}
+            onClick={() => setActiveTab('pending')}
+          >
+            Pending
+            <span className="followups-tab-count">{counts.pending}</span>
+          </button>
+          <button
+            className={`followups-tab-btn ${activeTab === 'clarification' ? 'active' : ''}`}
+            onClick={() => setActiveTab('clarification')}
+          >
+            Needs Clarification
+            <span className="followups-tab-count">{counts.clarification}</span>
+          </button>
+          <button
+            className={`followups-tab-btn ${activeTab === 'resolved' ? 'active' : ''}`}
+            onClick={() => setActiveTab('resolved')}
+          >
+            Resolved History
+            <span className="followups-tab-count">{counts.resolved}</span>
+          </button>
+        </div>
+
+        {/* Search Input */}
+        <div className="followups-search-wrap">
+          <Search size={14} style={{ position: 'absolute', left: '12px', top: '11px', color: 'var(--color-muted)' }} />
+          <input
+            type="text"
+            className="followups-search-input"
+            placeholder="Search questions, context, meetings..."
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+          />
+        </div>
+      </section>
+
+      {/* Main List Area */}
+      <div>
+        {loading ? (
+          <div className="panel" style={{ padding: '56px 20px', textAlign: 'center' }}>
+            <Loader2 size={26} className="spin-icon" style={{ margin: '0 auto 12px', color: 'var(--color-primary)' }} />
+            <p className="muted">Loading real persisted follow-up items...</p>
+          </div>
+        ) : filteredItems.length === 0 ? (
+          <div className="followups-empty-card">
+            <div className="followups-empty-icon-wrap">
+              <HelpCircle size={32} />
             </div>
-          ) : filteredItems.length === 0 ? (
-            <div className="mcard col" style={{ textAlign: 'center', padding: '48px 16px' }}>
-              <HelpCircle size={40} color="var(--color-muted)" style={{ margin: '0 auto 12px' }} />
-              <h3 style={{ fontSize: '16px', fontWeight: 600 }}>No follow-up items found</h3>
-              <p className="muted sm" style={{ maxWidth: '440px', margin: '6px auto 16px' }}>
-                {searchQuery || activeTab !== 'all'
-                  ? 'No records match your active search or filter selection.'
-                  : 'No transcript available. Upload a meeting transcript or enter meeting notes to get started.'}
-              </p>
-              <div>
-                <button
-                  className="btn primary sm"
-                  onClick={() => nav(isTeamLead ? '/team-lead/transcripts?upload=true' : '/user/transcripts?upload=true')}
+            <h3 className="followups-empty-title">No follow-up items found</h3>
+            <p className="followups-empty-text">
+              {searchQuery || activeTab !== 'all'
+                ? 'No records match your active search or filter selection.'
+                : 'No transcript questions available. Upload a meeting transcript or add follow-ups manually.'}
+            </p>
+            <div>
+              <button
+                className="btn primary sm"
+                onClick={() => nav(isTeamLead ? '/team-lead/transcripts?upload=true' : '/user/transcripts?upload=true')}
+              >
+                <FileText size={14} /> Upload Meeting Transcript
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="followups-list">
+            {filteredItems.map(item => {
+              const isResolved = item.status === 'Resolved'
+              const isMissingOwner = !item.assignedOwnerId && (!item.assignedOwnerName || item.assignedOwnerName === 'Unassigned')
+              const isMissingDeadline = !item.targetDeadline || item.targetDeadline === 'Unspecified'
+
+              const cardStatusClass = isResolved
+                ? 'status-resolved'
+                : (isMissingOwner || isMissingDeadline ? 'status-clarification' : 'status-pending')
+
+              return (
+                <div
+                  key={item.id}
+                  className={`followup-card ${cardStatusClass}`}
                 >
-                  <FileText size={14} /> Upload Meeting Transcript
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="stack" style={{ gap: '14px' }}>
-              {filteredItems.map(item => {
-                const isResolved = item.status === 'Resolved'
-                const isMissingOwner = !item.assignedOwnerId && (!item.assignedOwnerName || item.assignedOwnerName === 'Unassigned')
-                const isMissingDeadline = !item.targetDeadline || item.targetDeadline === 'Unspecified'
+                  {/* Card Header & Badges */}
+                  <div className="followup-card-header">
+                    <div className="followup-badges-row">
+                      <span className="followup-category-badge">
+                        {item.category || 'Follow-up'}
+                      </span>
 
-                return (
-                  <div
-                    key={item.id}
-                    className="mcard col"
-                    style={{
-                      borderLeft: isResolved
-                        ? '4px solid var(--color-success, #10b981)'
-                        : (isMissingOwner || isMissingDeadline ? '4px solid #f59e0b' : '4px solid var(--color-primary)'),
-                      padding: '16px 18px',
-                      background: 'var(--color-card, #ffffff)'
-                    }}
-                  >
-                    {/* Item Top Bar */}
-                    <div className="between" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: '8px' }}>
-                      <div className="row" style={{ gap: '10px', alignItems: 'center' }}>
-                        <span
-                          className="chip"
-                          style={{
-                            fontSize: '11px',
-                            fontWeight: 600,
-                            textTransform: 'uppercase',
-                            background: isResolved ? 'rgba(16, 185, 129, 0.12)' : 'rgba(99, 102, 241, 0.12)',
-                            color: isResolved ? '#059669' : 'var(--color-primary)'
-                          }}
-                        >
-                          {item.category || 'Follow-up'}
+                      <span className={`followup-status-tag ${isResolved ? 'resolved' : (isMissingOwner || isMissingDeadline ? 'clarification' : '')}`}>
+                        {isResolved ? <CheckCircle2 size={12} /> : <Clock size={12} />}
+                        {item.status || 'Pending'}
+                      </span>
+
+                      {item.sourceMeetingTitle && (
+                        <span className="followup-source-meeting">
+                          <FileText size={12} />
+                          {item.transcriptId ? (
+                            <Link
+                              to={`${analysisBase}/${item.transcriptId}/analysis`}
+                            >
+                              {item.sourceMeetingTitle}
+                            </Link>
+                          ) : (
+                            <span>{item.sourceMeetingTitle}</span>
+                          )}
                         </span>
+                      )}
+                    </div>
 
-                        <span
-                          className="tag"
-                          style={{
-                            background: isResolved ? 'var(--color-success, #10b981)' : (item.status === 'In Progress' ? '#f59e0b' : 'var(--color-muted)'),
-                            color: '#fff',
-                            fontSize: '11px'
-                          }}
+                    {/* Action buttons */}
+                    <div className="row" style={{ gap: '8px' }}>
+                      {isResolved ? (
+                        <button
+                          className="btn sm"
+                          onClick={() => handleReopen(item)}
+                          title="Re-open this question / follow-up"
                         >
-                          {item.status || 'Pending'}
-                        </span>
+                          <RotateCcw size={13} /> Re-open
+                        </button>
+                      ) : (
+                        <button
+                          className="btn primary sm"
+                          onClick={() => openResolveModal(item)}
+                        >
+                          <CheckCircle2 size={13} /> Resolve / Clarify
+                        </button>
+                      )}
+                    </div>
+                  </div>
 
-                        {item.sourceMeetingTitle && (
-                          <span className="muted sm row" style={{ gap: '4px', alignItems: 'center' }}>
-                            <FileText size={12} />
-                            {item.transcriptId ? (
-                              <Link
-                                to={`${analysisBase}/${item.transcriptId}/analysis`}
-                                className="link"
-                                style={{ fontWeight: 500 }}
-                              >
-                                {item.sourceMeetingTitle}
-                              </Link>
-                            ) : (
-                              <span>{item.sourceMeetingTitle}</span>
-                            )}
+                  {/* Title & Description */}
+                  <div>
+                    <h3 className="followup-card-title">
+                      {item.title}
+                    </h3>
+                    {item.description && (
+                      <p className="followup-card-desc">
+                        {item.description}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Evidence Quote */}
+                  {item.evidence && (
+                    <div className="followup-evidence-box">
+                      <MessageSquare size={14} style={{ flexShrink: 0, marginTop: '2px', color: 'var(--color-primary)' }} />
+                      <div>
+                        <span>"{item.evidence}"</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Meta Footer */}
+                  <div className="followup-card-meta">
+                    <div className="followup-meta-items">
+                      {/* Assigned Owner */}
+                      <div className="followup-meta-item">
+                        <User size={14} />
+                        <span>Owner:</span>
+                        {item.assignedOwnerName && item.assignedOwnerName !== 'Unassigned' ? (
+                          <span className="followup-owner-pill">{item.assignedOwnerName}</span>
+                        ) : (
+                          <span className="followup-owner-pill unassigned">
+                            <AlertCircle size={12} /> Unassigned (Awaiting Clarification)
                           </span>
                         )}
                       </div>
 
-                      {/* Action buttons */}
-                      <div className="row" style={{ gap: '8px' }}>
-                        {isResolved ? (
-                          <button
-                            className="btn sm"
-                            onClick={() => handleReopen(item)}
-                            title="Re-open this question / follow-up"
-                          >
-                            <RotateCcw size={13} /> Re-open
-                          </button>
+                      {/* Deadline */}
+                      <div className="followup-meta-item">
+                        <Calendar size={14} />
+                        <span>Target Date:</span>
+                        {item.targetDeadline && item.targetDeadline !== 'Unspecified' ? (
+                          <span className="followup-deadline-pill">{item.targetDeadline}</span>
                         ) : (
-                          <button
-                            className="btn primary sm"
-                            onClick={() => openResolveModal(item)}
-                          >
-                            <CheckCircle2 size={13} /> Resolve / Update
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Title & Description */}
-                    <div style={{ marginTop: '10px' }}>
-                      <h3 style={{ fontSize: '15px', fontWeight: 600, margin: '0 0 4px' }}>
-                        {item.title}
-                      </h3>
-                      {item.description && (
-                        <p className="sm" style={{ color: 'var(--color-text)', lineHeight: 1.5, margin: '0 0 8px' }}>
-                          {item.description}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Evidence Quote if available */}
-                    {item.evidence && (
-                      <div
-                        style={{
-                          background: 'var(--color-background-subtle, #f8fafc)',
-                          borderLeft: '3px solid var(--color-border)',
-                          padding: '8px 12px',
-                          borderRadius: '4px',
-                          fontSize: '12px',
-                          fontStyle: 'italic',
-                          color: 'var(--color-muted)',
-                          margin: '6px 0 10px'
-                        }}
-                      >
-                        <MessageSquare size={12} style={{ display: 'inline', marginRight: '6px', verticalAlign: '-1px' }} />
-                        "{item.evidence}"
-                      </div>
-                    )}
-
-                    {/* Clarification Warnings & Attributes */}
-                    <div className="between" style={{ flexWrap: 'wrap', gap: '10px', marginTop: '6px', borderTop: '1px solid var(--color-border)', paddingTop: '10px' }}>
-                      <div className="row" style={{ gap: '16px', flexWrap: 'wrap', fontSize: '12px' }}>
-                        {/* Assigned Owner */}
-                        <div className="row" style={{ gap: '5px', alignItems: 'center' }}>
-                          <User size={13} color="var(--color-muted)" />
-                          <span className="muted">Owner:</span>
-                          {item.assignedOwnerName ? (
-                            <b style={{ color: 'var(--color-text)' }}>{item.assignedOwnerName}</b>
-                          ) : (
-                            <span style={{ color: '#d97706', fontWeight: 600 }}>Unassigned (Awaiting Clarification)</span>
-                          )}
-                        </div>
-
-                        {/* Deadline */}
-                        <div className="row" style={{ gap: '5px', alignItems: 'center' }}>
-                          <Calendar size={13} color="var(--color-muted)" />
-                          <span className="muted">Target Date:</span>
-                          {item.targetDeadline && item.targetDeadline !== 'Unspecified' ? (
-                            <b style={{ color: 'var(--color-text)' }}>{item.targetDeadline}</b>
-                          ) : (
-                            <span style={{ color: '#d97706', fontWeight: 600 }}>Unspecified (Awaiting Confirmation)</span>
-                          )}
-                        </div>
-
-                        {/* Created Date */}
-                        {item.createdAt && (
-                          <div className="row" style={{ gap: '5px', alignItems: 'center' }}>
-                            <Clock size={13} color="var(--color-muted)" />
-                            <span className="muted">Added: {item.createdAt}</span>
-                          </div>
+                          <span className="followup-deadline-pill missing">
+                            <AlertCircle size={12} /> Unspecified (Awaiting Confirmation)
+                          </span>
                         )}
                       </div>
 
-                      {/* Resolution Audit Trail */}
-                      {isResolved && (
-                        <div style={{ fontSize: '11px', color: '#059669', fontWeight: 500 }}>
-                          Resolved {item.resolverName ? `by ${item.resolverName}` : ''} {item.resolvedAt ? `on ${item.resolvedAt}` : ''}
-                          {item.resolutionNotes && (
-                            <span style={{ display: 'block', color: 'var(--color-muted)', fontStyle: 'italic', marginTop: '2px' }}>
-                              Note: {item.resolutionNotes}
-                            </span>
-                          )}
+                      {/* Created Date */}
+                      {item.createdAt && (
+                        <div className="followup-meta-item">
+                          <Clock size={14} />
+                          <span>Added: {item.createdAt}</span>
                         </div>
                       )}
                     </div>
                   </div>
-                )
-              })}
-            </div>
-          )}
-        </div>
-      </section>
+
+                  {/* Resolution Audit Trail */}
+                  {isResolved && (
+                    <div className="followup-resolution-banner">
+                      <div className="row" style={{ gap: '6px', alignItems: 'center' }}>
+                        <CheckCircle2 size={14} />
+                        <span>
+                          <strong>Resolved</strong> {item.resolverName ? `by ${item.resolverName}` : ''} {item.resolvedAt ? `on ${item.resolvedAt}` : ''}
+                        </span>
+                      </div>
+                      {item.resolutionNotes && (
+                        <div style={{ marginTop: '4px', paddingLeft: '20px', fontStyle: 'italic', opacity: 0.9 }}>
+                          Note: {item.resolutionNotes}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
 
       {/* Resolution & Assignment Modal */}
       {selectedItem && (
         <Modal
           title={`Resolve & Clarify: "${selectedItem.title}"`}
           onClose={() => setSelectedItem(null)}
+          className="followup-modal"
         >
-          <form onSubmit={handleResolve} className="stack" style={{ gap: '16px' }}>
+          <form onSubmit={handleResolve} className="stack" style={{ gap: '14px', marginTop: '4px' }}>
             {actionError && (
-              <div style={{ color: 'var(--color-danger)', fontSize: '13px', background: 'rgba(239,68,68,0.1)', padding: '8px 12px', borderRadius: '4px' }}>
-                <AlertCircle size={14} style={{ display: 'inline', marginRight: '6px' }} />
+              <div style={{ color: 'var(--color-danger)', fontSize: '13px', background: 'rgba(239,68,68,0.1)', padding: '10px 14px', borderRadius: '8px' }}>
+                <AlertCircle size={14} style={{ display: 'inline', marginRight: '6px', verticalAlign: '-1px' }} />
                 {actionError}
               </div>
             )}
 
-            <div>
-              <label className="label">Item Description</label>
-              <p className="sm muted" style={{ marginTop: '2px' }}>
+            {/* Item Context Card */}
+            <div className="followup-modal-desc-card">
+              <div className="followup-modal-desc-title">Item Description & Scope</div>
+              <p className="followup-modal-desc-text">
                 {selectedItem.description || selectedItem.title}
               </p>
               {selectedItem.evidence && (
-                <div style={{ fontSize: '12px', fontStyle: 'italic', color: 'var(--color-muted)', marginTop: '4px' }}>
+                <div className="followup-modal-evidence">
                   Transcript evidence: "{selectedItem.evidence}"
                 </div>
               )}
             </div>
 
             {/* Assign Registered User */}
-            <div>
-              <label className="label">Assign Accountable Member</label>
+            <div className="form-group">
+              <label className="form-label">Assign Accountable Member</label>
               <select
-                className="input"
+                className="form-select"
                 value={assignedOwnerId}
                 onChange={e => setAssignedOwnerId(e.target.value)}
               >
-                <option value="">-- Leave Unassigned --</option>
+                <option value="">-- Leave Unassigned (Needs Clarification) --</option>
                 {activeUsers.map(u => (
                   <option key={u.id} value={u.id}>
-                    {u.name} ({u.role}) - {u.email}
+                    {u.name} ({u.role}) — {u.email}
                   </option>
                 ))}
               </select>
-              <p className="muted sm" style={{ marginTop: '3px' }}>
+              <p className="form-help">
                 Maps to registered database users only. Never automatically creates user accounts.
               </p>
             </div>
 
             {/* Target Deadline */}
-            <div>
-              <label className="label">Target Resolution Deadline</label>
+            <div className="form-group">
+              <label className="form-label">Target Resolution Deadline</label>
               <input
                 type="date"
-                className="input"
+                className="form-input"
                 value={targetDeadline}
                 onChange={e => setTargetDeadline(e.target.value)}
               />
-              <p className="muted sm" style={{ marginTop: '3px' }}>
+              <p className="form-help">
                 Exact deadline confirmed during or following meeting discussion.
               </p>
             </div>
 
             {/* Resolution Notes */}
-            <div>
-              <label className="label">Resolution / Clarification Notes</label>
+            <div className="form-group">
+              <label className="form-label">Resolution / Clarification Notes</label>
               <textarea
-                className="input"
+                className="form-textarea"
                 rows={3}
                 placeholder="Explain how this question or follow-up was answered or resolved..."
                 value={resolveNotes}
@@ -549,7 +598,8 @@ export default function FollowUps({ isTeamLead = false }) {
               />
             </div>
 
-            <div className="between" style={{ marginTop: '8px', gap: '8px' }}>
+            {/* Modal Actions Footer */}
+            <div className="followup-modal-footer">
               <button
                 type="button"
                 className="btn sm"
@@ -560,7 +610,7 @@ export default function FollowUps({ isTeamLead = false }) {
                 Save Updates Only
               </button>
 
-              <div className="row" style={{ gap: '8px' }}>
+              <div className="followup-modal-footer-actions">
                 <button
                   type="button"
                   className="btn sm"
@@ -587,20 +637,21 @@ export default function FollowUps({ isTeamLead = false }) {
         <Modal
           title="Add New Follow-Up Action or Question"
           onClose={() => setShowNewModal(false)}
+          className="followup-modal"
         >
-          <form onSubmit={handleCreateNew} className="stack" style={{ gap: '14px' }}>
+          <form onSubmit={handleCreateNew} className="stack" style={{ gap: '14px', marginTop: '4px' }}>
             {actionError && (
-              <div style={{ color: 'var(--color-danger)', fontSize: '13px' }}>
-                <AlertCircle size={14} style={{ display: 'inline', marginRight: '6px' }} />
+              <div style={{ color: 'var(--color-danger)', fontSize: '13px', background: 'rgba(239,68,68,0.1)', padding: '10px 14px', borderRadius: '8px' }}>
+                <AlertCircle size={14} style={{ display: 'inline', marginRight: '6px', verticalAlign: '-1px' }} />
                 {actionError}
               </div>
             )}
 
-            <div>
-              <label className="label">Title *</label>
+            <div className="form-group">
+              <label className="form-label">Title *</label>
               <input
                 type="text"
-                className="input"
+                className="form-input"
                 required
                 placeholder="e.g. Clarify staging security checklist with ops lead"
                 value={newTitle}
@@ -608,10 +659,10 @@ export default function FollowUps({ isTeamLead = false }) {
               />
             </div>
 
-            <div>
-              <label className="label">Category</label>
+            <div className="form-group">
+              <label className="form-label">Category</label>
               <select
-                className="input"
+                className="form-select"
                 value={newCategory}
                 onChange={e => setNewCategory(e.target.value)}
               >
@@ -623,10 +674,10 @@ export default function FollowUps({ isTeamLead = false }) {
               </select>
             </div>
 
-            <div>
-              <label className="label">Associated Meeting / Transcript</label>
+            <div className="form-group">
+              <label className="form-label">Associated Meeting / Transcript</label>
               <select
-                className="input"
+                className="form-select"
                 value={newTranscriptId}
                 onChange={e => setNewTranscriptId(e.target.value)}
               >
@@ -639,10 +690,10 @@ export default function FollowUps({ isTeamLead = false }) {
               </select>
             </div>
 
-            <div>
-              <label className="label">Details & Context</label>
+            <div className="form-group">
+              <label className="form-label">Details & Context</label>
               <textarea
-                className="input"
+                className="form-textarea"
                 rows={3}
                 placeholder="Details of the question or what needs to be delivered..."
                 value={newDescription}
@@ -650,7 +701,8 @@ export default function FollowUps({ isTeamLead = false }) {
               />
             </div>
 
-            <div className="between" style={{ marginTop: '8px' }}>
+            {/* Modal Actions Footer */}
+            <div className="followup-modal-footer">
               <button
                 type="button"
                 className="btn sm"
